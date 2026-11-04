@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate tag and version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v(\d+)\.(\d+)\.(\d+)$') {
+            throw "Invalid tag '$tag': use the vX.Y.Z format"
+          }
+          $version = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+          $manifest = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $manifest) {
+            throw "Version not found in Cargo.toml"
+          }
+          $cargoVersion = $manifest.Matches[0].Groups[1].Value
+          if ($cargoVersion -ne $version) {
+            throw "Cargo.toml declares v$cargoVersion but the tag is v$version"
+          }
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup installation failed" }
+
+      - name: Build Windows setup
+        shell: pwsh
+        run: |
+          $roots = @(
+            [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86),
+            $env:ProgramFiles
+          ) | Where-Object { $_ }
+          $iscc = $null
+          foreach ($root in $roots) {
+            $candidate = Get-ChildItem -Path $root -Directory -Filter "Inno Setup*" -ErrorAction SilentlyContinue |
+              ForEach-Object { Join-Path $_.FullName "ISCC.exe" } |
+              Where-Object { Test-Path $_ } |
+              Select-Object -First 1
+            if ($candidate) { $iscc = $candidate; break }
+          }
+          if (-not $iscc) {
+            $command = Get-Command iscc -ErrorAction SilentlyContinue
+            if ($command) { $iscc = $command.Source }
+          }
+          if (-not $iscc) { throw "ISCC.exe not found" }
+          & $iscc "installer\simple-soundboard.iss" "/DAppVersion=$env:APP_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "Setup build failed" }
+          Get-ChildItem dist
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "SimpleSoundboard v${{ env.APP_VERSION }}"
+          generate_release_notes: true
+          files: dist/SimpleSoundboard-Setup-${{ env.APP_VERSION }}.exe
+          fail_on_unmatched_files: true
