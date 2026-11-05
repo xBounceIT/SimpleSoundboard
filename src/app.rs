@@ -40,7 +40,12 @@ gpui_kit::actions!(
 );
 
 const STATE_VERSION: u32 = 2;
-pub(crate) const SOUNDS_PER_PAGE: usize = 6;
+
+/// Page-size choices offered by the pagination footer, in sounds per page.
+pub(crate) const PAGE_SIZE_OPTIONS: [usize; 7] = [3, 6, 9, 12, 18, 24, 48];
+
+/// Ceiling for [`PageSize::Auto`] on very tall windows.
+const MAX_AUTO_PAGE_SIZE: usize = 60;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PersistedState {
@@ -66,6 +71,9 @@ struct PersistedState {
     monitor_device: Option<String>,
     #[serde(default)]
     monitor_enabled: Option<bool>,
+    /// Sounds per page; `None` is the Auto behaviour.
+    #[serde(default)]
+    per_page: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,10 +102,174 @@ enum TrimDrag {
     Window { grab: f32 },
 }
 
+/// The point of a pad waveform under the pointer, previewed before a click
+/// commits it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WaveformHover {
+    sound_id: SoundId,
+    /// Position inside the clip, from 0 to 1.
+    ratio: f32,
+}
+
+/// How many sounds the library shows on one page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PageSize {
+    /// Fit as many pads as the window has room for.
+    #[default]
+    Auto,
+    /// A size picked from [`PAGE_SIZE_OPTIONS`].
+    Fixed(usize),
+}
+
+impl PageSize {
+    fn from_saved(value: Option<usize>) -> Self {
+        match value {
+            Some(size) if PAGE_SIZE_OPTIONS.contains(&size) => Self::Fixed(size),
+            _ => Self::Auto,
+        }
+    }
+
+    fn saved(self) -> Option<usize> {
+        match self {
+            Self::Auto => None,
+            Self::Fixed(size) => Some(size),
+        }
+    }
+
+    fn label(self) -> SharedString {
+        match self {
+            Self::Auto => SharedString::from("Auto"),
+            Self::Fixed(size) => SharedString::from(size.to_string()),
+        }
+    }
+
+    /// Position of this choice in the select, where 0 is Auto.
+    fn index(self) -> usize {
+        match self {
+            Self::Auto => 0,
+            Self::Fixed(size) => PAGE_SIZE_OPTIONS
+                .iter()
+                .position(|option| *option == size)
+                .map(|index| index + 1)
+                .unwrap_or(0),
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        if label.eq_ignore_ascii_case("auto") {
+            return Some(Self::Auto);
+        }
+        let size = label.parse::<usize>().ok()?;
+        PAGE_SIZE_OPTIONS
+            .contains(&size)
+            .then_some(Self::Fixed(size))
+    }
+}
+
+fn page_size_labels() -> Vec<SharedString> {
+    std::iter::once(PageSize::Auto.label())
+        .chain(
+            PAGE_SIZE_OPTIONS
+                .iter()
+                .map(|size| SharedString::from(size.to_string())),
+        )
+        .collect()
+}
+
+/// Sounds per page that fit the current window when [`PageSize::Auto`] is
+/// selected.
+fn auto_page_size(window: &Window) -> usize {
+    auto_page_size_for(
+        f32::from(window.viewport_size().width),
+        f32::from(window.viewport_size().height),
+        f32::from(window.rem_size()),
+    )
+}
+
+/// The page size that fills the library with whole rows of pads.
+///
+/// The measurements mirror the rem-based layout in `view.rs`:
+///
+/// * a 4rem title bar (`h_16`) and a 6rem transport bar (`h_24`) sit above and
+///   below the library;
+/// * the library toolbar adds 3.75rem (`pt_5` + the 2rem search field + `pb_2`)
+///   and the pagination footer 3rem (`py_3` around small controls);
+/// * pads are 12rem tall (`h_48`) and 32% wide, with a 0.75rem gap (`gap_3`)
+///   and 2rem of vertical padding inside the grid (`pt_3` + `pb_5`).
+///
+/// The trim editor temporarily shrinks the listing, but Auto deliberately
+/// follows only the window so the page size stays put while trimming.
+///
+/// Keep those values in sync if the layout around the library changes.
+fn auto_page_size_for(width: f32, height: f32, rem: f32) -> usize {
+    let rem = rem.max(1.0);
+    let library_width = (width - 20.0 * rem).max(1.0); // routing panel `w_80`
+    let content_width = (library_width - 2.5 * rem).max(1.0); // grid `px_5`
+    let gap = 0.75 * rem;
+    let tile_width = 0.32 * content_width;
+    let columns = (((content_width + gap) / (tile_width + gap)).floor() as usize).max(1);
+
+    let grid_height = (height - 16.75 * rem).max(0.0);
+    let content_height = (grid_height - 2.0 * rem).max(0.0);
+    let rows = (((content_height + gap) / (12.0 * rem + gap)).floor() as usize).max(1);
+
+    (columns * rows).clamp(1, MAX_AUTO_PAGE_SIZE)
+}
+
+/// Position of a pointer inside a pad waveform, as a fraction of the clip.
+///
+/// `None` keeps pad clicks toggling playback everywhere except on the
+/// waveform row, where a click jumps to the matching point of the clip.
+fn waveform_ratio(bounds: &Bounds<Pixels>, position: Point<Pixels>) -> Option<f32> {
+    if !bounds.contains(&position) {
+        return None;
+    }
+    let width = f32::from(bounds.size.width);
+    if width <= 0.0 {
+        return None;
+    }
+    Some(((f32::from(position.x) - f32::from(bounds.origin.x)) / width).clamp(0.0, 1.0))
+}
+
+/// Extra tolerance below the bars while the waveform is still growing.
+///
+/// The hovered row expands under the pointer; without a small margin the
+/// pointer would fall outside the last painted bounds mid-animation and the
+/// preview would flicker on and off.
+const WAVEFORM_HOVER_SLOP: f32 = 4.0;
+
+/// Position under the pointer inside the waveform seek zone.
+///
+/// This is [`waveform_ratio`] with a little room under the resting row so the
+/// preview stays stable while the row grows toward the pointer. Hover and
+/// click share it, so whatever shows a preview also seeks when clicked.
+fn waveform_seek_ratio(bounds: &Bounds<Pixels>, position: Point<Pixels>) -> Option<f32> {
+    let zone = Bounds {
+        origin: bounds.origin,
+        size: size(
+            bounds.size.width,
+            bounds.size.height + px(WAVEFORM_HOVER_SLOP),
+        ),
+    };
+    waveform_ratio(&zone, position)
+}
+
+/// Whether the bar at `index` of `count` sits left of `ratio`.
+///
+/// Bars are compared by their centre so a fill covers the bar the pointer is
+/// actually over instead of snapping to the bar's left edge.
+fn waveform_bar_filled(index: usize, count: usize, ratio: f32) -> bool {
+    if count == 0 {
+        return false;
+    }
+    ((index as f32 + 0.5) / count as f32) <= ratio
+}
+
 pub struct SoundboardApp {
     sounds: Vec<Sound>,
     selected_id: Option<SoundId>,
     hovered_sound: Option<SoundId>,
+    waveform_hover: Option<WaveformHover>,
     master_volume: f32,
     muted: bool,
     mic_monitor: bool,
@@ -142,6 +314,8 @@ pub struct SoundboardApp {
     search_input: Entity<InputState>,
     search_query: String,
     page: usize,
+    page_size: PageSize,
+    page_size_select: Entity<SelectState<Vec<SharedString>>>,
     shortcut_target: Option<SoundId>,
     shortcut_error: Option<SharedString>,
 
@@ -345,9 +519,22 @@ impl SoundboardApp {
             .map(|path| sound_id(&path))
             .filter(|id| sounds.iter().any(|sound| sound.id == *id))
             .or_else(|| sounds.first().map(|sound| sound.id));
+        let page_size = PageSize::from_saved(persisted.per_page);
+        let page_size_select = cx.new(|cx| {
+            SelectState::new(
+                page_size_labels(),
+                Some(IndexPath::default().row(page_size.index())),
+                window,
+                cx,
+            )
+        });
+        let initial_per_page = match page_size {
+            PageSize::Auto => auto_page_size(window),
+            PageSize::Fixed(size) => size,
+        };
         let initial_page = selected_id
             .and_then(|id| sounds.iter().position(|sound| sound.id == id))
-            .map(|index| index / SOUNDS_PER_PAGE)
+            .map(|index| index / initial_per_page.max(1))
             .unwrap_or(0);
 
         let focus_handle = cx.focus_handle();
@@ -356,6 +543,7 @@ impl SoundboardApp {
             sounds,
             selected_id,
             hovered_sound: None,
+            waveform_hover: None,
             master_volume,
             muted: false,
             mic_monitor: mic_monitor && input_device.is_some(),
@@ -395,6 +583,8 @@ impl SoundboardApp {
             search_input,
             search_query: String::new(),
             page: initial_page,
+            page_size,
+            page_size_select,
             shortcut_target: None,
             shortcut_error: None,
             available_update: None,
@@ -525,6 +715,18 @@ impl SoundboardApp {
                         this.search_query = this.search_input.read(cx).value().to_string();
                         this.page = 0;
                         cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &app.page_size_select,
+                window,
+                |this, _, event: &SelectEvent<Vec<SharedString>>, window, cx| {
+                    let SelectEvent::Confirm(Some(label)) = event else {
+                        return;
+                    };
+                    if let Some(size) = PageSize::from_label(label.as_ref()) {
+                        this.change_page_size(size, window, cx);
                     }
                 },
             ),
@@ -833,7 +1035,8 @@ impl SoundboardApp {
         }
         let preview_duration = end - start;
         let preview = source.trimmed(start, end);
-        self.audio.trigger(id, Arc::new(preview), volume, false);
+        self.audio
+            .trigger(id, Arc::new(preview), volume, false, 0.0);
         self.selected_id = Some(id);
         self.paused = false;
         self.trim_preview_active = true;
@@ -1055,7 +1258,7 @@ impl SoundboardApp {
             return;
         };
 
-        self.reveal_sound(id);
+        self.reveal_sound(id, self.per_page(window));
         self.activate_sound(id, window, cx);
         cx.stop_propagation();
     }
@@ -1083,10 +1286,18 @@ impl SoundboardApp {
             .collect()
     }
 
-    fn page_count(&self) -> usize {
+    /// Sounds shown on one page: the selected fixed size or the window fit.
+    fn per_page(&self, window: &Window) -> usize {
+        match self.page_size {
+            PageSize::Auto => auto_page_size(window),
+            PageSize::Fixed(size) => size,
+        }
+    }
+
+    fn page_count(&self, per_page: usize) -> usize {
         self.filtered_sound_indices()
             .len()
-            .div_ceil(SOUNDS_PER_PAGE)
+            .div_ceil(per_page.max(1))
             .max(1)
     }
 
@@ -1097,25 +1308,37 @@ impl SoundboardApp {
         }
     }
 
-    fn next_page(&mut self, cx: &mut Context<Self>) {
-        if self.page + 1 < self.page_count() {
+    fn next_page(&mut self, per_page: usize, cx: &mut Context<Self>) {
+        if self.page + 1 < self.page_count(per_page) {
             self.page += 1;
             cx.notify();
         }
     }
 
-    fn clamp_page(&mut self) {
-        self.page = self.page.min(self.page_count() - 1);
+    fn clamp_page(&mut self, per_page: usize) {
+        self.page = self.page.min(self.page_count(per_page) - 1);
     }
 
-    fn reveal_sound(&mut self, id: SoundId) {
+    fn reveal_sound(&mut self, id: SoundId, per_page: usize) {
         let filtered = self.filtered_sound_indices();
         if let Some(position) = filtered
             .iter()
             .position(|&index| self.sounds[index].id == id)
         {
-            self.page = position / SOUNDS_PER_PAGE;
+            self.page = position / per_page.max(1);
         }
+    }
+
+    /// Switch page size, keeping the page that holds the first visible pad.
+    fn change_page_size(&mut self, size: PageSize, window: &mut Window, cx: &mut Context<Self>) {
+        if size == self.page_size {
+            return;
+        }
+        let first_visible = self.page.saturating_mul(self.per_page(window));
+        self.page_size = size;
+        self.page = first_visible / self.per_page(window).max(1);
+        self.save_state();
+        cx.notify();
     }
 
     fn choose_monitor(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1416,6 +1639,17 @@ impl SoundboardApp {
     }
 
     fn play_sound(&mut self, id: SoundId, window: &mut Window, cx: &mut Context<Self>) {
+        self.play_sound_from(id, 0.0, window, cx);
+    }
+
+    /// Start a sound, optionally from a fraction of its trimmed duration.
+    fn play_sound_from(
+        &mut self,
+        id: SoundId,
+        start_ratio: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.output_device.is_none() {
             window.push_notification("Choose an audio output before going on air.", cx);
             return;
@@ -1433,10 +1667,12 @@ impl SoundboardApp {
             return;
         };
 
+        let start_ratio = start_ratio.clamp(0.0, 1.0);
         let duration = decoded.duration;
         self.selected_id = Some(id);
         self.trim_preview_active = false;
-        self.audio.trigger(id, decoded, sound.volume, self.looping);
+        self.audio
+            .trigger(id, decoded, sound.volume, self.looping, start_ratio);
         self.paused = false;
         self.playback_elapsed = 0.0;
         self.playback_generation = self.playback_generation.wrapping_add(1);
@@ -1446,11 +1682,85 @@ impl SoundboardApp {
         self.seek_preview = 0.0;
         self.transport = self.audio.snapshot().current;
         self.seek_slider.update(cx, |slider, cx| {
-            slider.set_value(0.0, window, cx);
+            slider.set_value(start_ratio * 100.0, window, cx);
         });
         self.schedule_playback_fallback(duration, generation, window, cx);
         self.save_state();
         cx.notify();
+    }
+
+    /// Jump to a point of a pad's waveform: seek the clip already on air, or
+    /// start it from there.
+    fn seek_from_waveform(
+        &mut self,
+        id: SoundId,
+        ratio: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let can_seek = self
+            .sounds
+            .iter()
+            .any(|sound| sound.id == id && sound.is_ready() && sound.duration() > 0.0);
+        if !can_seek {
+            return;
+        }
+
+        let ratio = ratio.clamp(0.0, 1.0);
+        let is_current = self
+            .transport
+            .as_ref()
+            .is_some_and(|current| current.sound_id == id);
+        if !is_current {
+            self.play_sound_from(id, ratio, window, cx);
+            return;
+        }
+
+        let selection_changed = self.selected_id != Some(id);
+        self.selected_id = Some(id);
+        self.audio.seek_ratio(ratio);
+        self.paused = false;
+        self.audio.set_paused(false);
+        self.playback_elapsed = 0.0;
+        self.last_telemetry = Instant::now();
+        self.seek_dragging = false;
+        self.transport = self.audio.snapshot().current;
+        self.seek_slider.update(cx, |slider, cx| {
+            slider.set_value(ratio * 100.0, window, cx);
+        });
+        if selection_changed {
+            self.save_state();
+        }
+        cx.notify();
+    }
+
+    /// Track the pointer over a pad waveform so the pad can preview the seek
+    /// before the click commits it.
+    fn preview_waveform_hover(&mut self, id: SoundId, ratio: Option<f32>, cx: &mut Context<Self>) {
+        let next = ratio.map(|ratio| WaveformHover {
+            sound_id: id,
+            ratio,
+        });
+        let changed = match (self.waveform_hover, next) {
+            (Some(current), Some(next)) => {
+                current.sound_id != next.sound_id
+                    // Sub-pixel moves are not worth a repaint.
+                    || (current.ratio - next.ratio).abs() > 0.002
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        if changed {
+            self.waveform_hover = next;
+            cx.notify();
+        }
+    }
+
+    /// Drop the waveform preview, if any.
+    fn clear_waveform_hover(&mut self, cx: &mut Context<Self>) {
+        if self.waveform_hover.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn schedule_playback_fallback(
@@ -1547,7 +1857,7 @@ impl SoundboardApp {
         let was_playing = self.is_playing();
         let id = self.sounds[next].id;
         self.selected_id = Some(id);
-        self.reveal_sound(id);
+        self.reveal_sound(id, self.per_page(window));
         if was_playing {
             self.play_sound(id, window, cx);
         } else {
@@ -1904,7 +2214,7 @@ impl SoundboardApp {
                 input.set_value("", window, cx);
             });
         }
-        self.clamp_page();
+        self.clamp_page(self.per_page(window));
         self.save_state();
         if trim_open {
             self.maybe_open_next_trim(window, cx);
@@ -1958,6 +2268,7 @@ impl SoundboardApp {
             input_device: self.input_device.clone(),
             monitor_device: self.monitor_device.clone(),
             monitor_enabled: Some(self.monitor_device.is_some()),
+            per_page: self.page_size.saved(),
         };
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -2188,10 +2499,110 @@ fn load_state() -> PersistedState {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_monitor_device, build_monitor_devices, playback_watchdog_expired, state_path,
+        PageSize, auto_monitor_device, auto_page_size_for, build_monitor_devices,
+        playback_watchdog_expired, state_path, waveform_bar_filled, waveform_ratio,
+        waveform_seek_ratio,
     };
     use crate::audio::DeviceChoice;
+    use gpui_kit::{Bounds, point, px, size};
     use std::path::Path;
+
+    #[test]
+    fn waveform_clicks_map_to_positions_inside_the_clip() {
+        let bounds = Bounds {
+            origin: point(px(35.0), px(208.0)),
+            size: size(px(200.0), px(22.0)),
+        };
+        assert_eq!(
+            waveform_ratio(&bounds, point(px(35.0), px(219.0))),
+            Some(0.0)
+        );
+        assert_eq!(
+            waveform_ratio(&bounds, point(px(85.0), px(219.0))),
+            Some(0.25)
+        );
+        assert_eq!(
+            waveform_ratio(&bounds, point(px(135.0), px(219.0))),
+            Some(0.5)
+        );
+        assert_eq!(
+            waveform_ratio(&bounds, point(px(185.0), px(219.0))),
+            Some(0.75)
+        );
+        // Clicks outside the row still toggle the pad.
+        assert_eq!(waveform_ratio(&bounds, point(px(235.0), px(219.0))), None);
+        assert_eq!(waveform_ratio(&bounds, point(px(35.0), px(180.0))), None);
+        assert_eq!(waveform_ratio(&bounds, point(px(300.0), px(219.0))), None);
+    }
+
+    #[test]
+    fn waveform_seek_zone_includes_a_small_margin_below_the_bars() {
+        let bounds = Bounds {
+            origin: point(px(35.0), px(208.0)),
+            size: size(px(200.0), px(22.0)),
+        };
+        assert_eq!(
+            waveform_seek_ratio(&bounds, point(px(135.0), px(219.0))),
+            Some(0.5)
+        );
+        // The pointer may sit a few pixels under the bars while the row grows
+        // toward it without losing the preview.
+        assert_eq!(
+            waveform_seek_ratio(&bounds, point(px(85.0), px(228.0))),
+            Some(0.25)
+        );
+        // Above the row, or far below it, is the rest of the pad.
+        assert_eq!(
+            waveform_seek_ratio(&bounds, point(px(85.0), px(205.0))),
+            None
+        );
+        assert_eq!(
+            waveform_seek_ratio(&bounds, point(px(85.0), px(240.0))),
+            None
+        );
+        assert_eq!(
+            waveform_seek_ratio(&bounds, point(px(300.0), px(219.0))),
+            None
+        );
+    }
+
+    #[test]
+    fn waveform_fill_uses_bar_centres() {
+        // Four bars: a half-way position lights the first two.
+        assert!(waveform_bar_filled(0, 4, 0.5));
+        assert!(waveform_bar_filled(1, 4, 0.5));
+        assert!(!waveform_bar_filled(2, 4, 0.5));
+        assert!(!waveform_bar_filled(3, 4, 0.5));
+        // The very start and the very end fill nothing and everything.
+        assert!(!waveform_bar_filled(0, 4, 0.0));
+        assert!(waveform_bar_filled(3, 4, 1.0));
+        assert!(!waveform_bar_filled(0, 0, 1.0));
+    }
+
+    #[test]
+    fn auto_page_size_fills_the_library_with_whole_rows() {
+        // Default 1280×860 window: three rows of three pads fit.
+        assert_eq!(auto_page_size_for(1280.0, 860.0, 15.0), 9);
+        // Minimum 1120×760 window: only two rows fit.
+        assert_eq!(auto_page_size_for(1120.0, 760.0, 15.0), 6);
+        // A taller window gains a row.
+        assert_eq!(auto_page_size_for(1280.0, 1080.0, 15.0), 12);
+        // Smaller windows never go below a single row.
+        assert_eq!(auto_page_size_for(400.0, 300.0, 15.0), 2);
+    }
+
+    #[test]
+    fn page_size_round_trips_through_saved_state() {
+        assert_eq!(PageSize::from_saved(None), PageSize::Auto);
+        assert_eq!(PageSize::from_saved(Some(6)), PageSize::Fixed(6));
+        assert_eq!(PageSize::from_saved(Some(7)), PageSize::Auto);
+        assert_eq!(PageSize::Auto.saved(), None);
+        assert_eq!(PageSize::Fixed(9).saved(), Some(9));
+        assert_eq!(PageSize::from_label("Auto"), Some(PageSize::Auto));
+        assert_eq!(PageSize::from_label("12"), Some(PageSize::Fixed(12)));
+        assert_eq!(PageSize::from_label("7"), None);
+        assert_eq!(PageSize::Fixed(24).index(), 6);
+    }
 
     #[test]
     fn state_path_is_outside_the_project_when_appdata_exists() {

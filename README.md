@@ -9,7 +9,8 @@ A desktop audio console for routing clips and voice into a virtual microphone, b
 - Imports **MP3, WAV, OGG and FLAC** files from the native picker, by dropping them onto the window, or with `Ctrl+O`.
 - After import it opens the trim editor automatically, so you can keep only a portion of the clip. **Audition** plays the selection with a playhead showing the current position.
 - Every clip becomes a pad in the bank. **Grab the grid handle** to change the order; right-click for Rename, Trim or Delete. Rename turns the pad title itself into an editable field.
-- **Search by title** and page through the bank six pads at a time. The search filters as you type and resets to the first page.
+- **Click a point on a pad's waveform** to jump straight to it: the clip on air seeks there, and any other pad starts from that point. Clicks elsewhere on the pad still play or stop it. Hovering a waveform previews the jump first — the band grows, the bars light up to the pointer and the pad shows the time under the cursor.
+- **Search by title** and page through the bank. The footer sets how many pads appear per page — **Auto** fills the window with whole rows — and the search filters as you type, resetting to the first page.
 - Assign each pad a **keyboard shortcut**: right-click the pad, choose Set shortcut, then press a Ctrl/Alt combination or an F-key. Shortcuts are checked for conflicts and saved with the bank.
 - Plays one clip at a time: a new trigger stops the previous clip, and when the track ends the transport returns to ready. Click a pad that is on air to stop it; click it again to restart.
 - Choose the audio output that receives the mix: a virtual cable, an audio interface or a mixer.
@@ -17,7 +18,7 @@ A desktop audio console for routing clips and voice into a virtual microphone, b
 - **Headphone monitor**: hear the same mix in headphones even when the main output goes to Discord.
 - Shows a two-needle analog VU meter for the output and a signal indicator for the microphone.
 - Controls: previous, play/pause, stop, next, loop, seek, master volume and **independent volume per pad**.
-- Remembers the bank, names, trims, volumes, devices and monitor in `%APPDATA%\SimpleSoundboard\state.json`. Development builds use a separate profile in `%APPDATA%\SimpleSoundboard-Dev\state.json`.
+- Remembers the bank, names, trims, volumes, devices, monitor and page size in `%APPDATA%\SimpleSoundboard\state.json`. Development builds use a separate profile in `%APPDATA%\SimpleSoundboard-Dev\state.json`.
 - Checks for updates on every launch and, when a newer version exists, shows a bottom-right notification with **Update now** and **See changes**.
 
 ## Routing to Discord

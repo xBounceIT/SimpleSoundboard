@@ -15,11 +15,12 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Bounds, ExternalPaths, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement as _, PathBuilder, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, WindowControlArea, canvas, div, point,
-    prelude::FluentBuilder as _, px, quad, relative, size, transparent_black,
+    AnimationExt as _, AnyElement, App, AppContext as _, Bounds, ClickEvent, CursorStyle,
+    ExternalPaths, FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, PathBuilder,
+    Render, SharedString, SpringAnimation, SpringConfig, StatefulInteractiveElement as _,
+    Styled as _, Window, WindowControlArea, canvas, div, point, prelude::FluentBuilder as _, px,
+    quad, relative, rems, size, transparent_black,
 };
 
 use super::{SoundboardApp, TrimDrag};
@@ -28,7 +29,7 @@ use crate::{
         Sound, SoundId, SoundStatus, format_duration, format_percent, format_time_precise,
         normalize_peak, peak_to_db,
     },
-    theme::{BODY_FONT, DISPLAY_FONT, MONO_FONT, palette},
+    theme::{BODY_FONT, DISPLAY_FONT, MONO_FONT, Palette, palette},
     update,
 };
 
@@ -69,7 +70,7 @@ impl Render for SoundboardApp {
                     .min_h_0()
                     .flex()
                     .items_stretch()
-                    .child(self.render_library(cx))
+                    .child(self.render_library(window, cx))
                     .child(self.render_routing(cx)),
             )
             .child(self.render_transport(cx))
@@ -391,35 +392,41 @@ impl SoundboardApp {
             .child(controls)
     }
 
-    fn render_library(&mut self, cx: &mut gpui_kit::Context<Self>) -> impl IntoElement {
+    fn render_library(
+        &mut self,
+        window: &Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> impl IntoElement {
         let p = palette();
         let trim_open = self.trim_target.is_some();
 
         let body = if self.sounds.is_empty() {
             self.render_empty_state(cx).into_any_element()
         } else {
+            let per_page = self.per_page(window).max(1);
             let filtered = self.filtered_sound_indices();
-            let total_pages = filtered.len().div_ceil(super::SOUNDS_PER_PAGE).max(1);
+            let total_pages = filtered.len().div_ceil(per_page).max(1);
             let page = self.page.min(total_pages - 1);
             self.page = page;
-            let start = page * super::SOUNDS_PER_PAGE;
-            let end = (start + super::SOUNDS_PER_PAGE).min(filtered.len());
+            let start = page * per_page;
+            let end = (start + per_page).min(filtered.len());
             let page_indices = filtered[start..end].to_vec();
             let list = if filtered.is_empty() {
                 self.render_no_results(cx).into_any_element()
             } else {
                 self.render_grid(&page_indices, cx).into_any_element()
             };
+            let count = filtered.len();
 
             div()
                 .flex_1()
                 .min_h_0()
                 .flex()
                 .flex_col()
-                .child(self.render_library_toolbar(filtered.len(), cx))
+                .child(self.render_library_toolbar(count, cx))
                 .child(list)
-                .when(total_pages > 1, |this| {
-                    this.child(self.render_pagination(total_pages, cx))
+                .when(count > 0, |this| {
+                    this.child(self.render_pagination(count, per_page, cx))
                 })
                 .into_any_element()
         };
@@ -536,17 +543,23 @@ impl SoundboardApp {
 
     fn render_pagination(
         &mut self,
-        total_pages: usize,
+        count: usize,
+        per_page: usize,
         cx: &mut gpui_kit::Context<Self>,
     ) -> impl IntoElement {
         let p = palette();
+        let total_pages = count.div_ceil(per_page.max(1)).max(1);
+        let page = self.page.min(total_pages - 1);
+        let first = page * per_page + 1;
+        let last = ((page + 1) * per_page).min(count);
+
         let previous = Button::new("page-previous")
             .icon(Icon::new(AppIcon::ChevronLeft))
             .small()
             .ghost()
             .accessibility_label("Previous page")
             .tooltip("Previous page")
-            .disabled(self.page == 0)
+            .disabled(page == 0)
             .on_click(cx.listener(|this, _, _, cx| this.previous_page(cx)));
 
         let next = Button::new("page-next")
@@ -555,26 +568,52 @@ impl SoundboardApp {
             .ghost()
             .accessibility_label("Next page")
             .tooltip("Next page")
-            .disabled(self.page + 1 >= total_pages)
-            .on_click(cx.listener(|this, _, _, cx| this.next_page(cx)));
+            .disabled(page + 1 >= total_pages)
+            .on_click(cx.listener(move |this, _, _, cx| this.next_page(per_page, cx)));
 
+        let page_size_select = Select::new(&self.page_size_select)
+            .small()
+            .accessibility_label("Sounds per page");
+
+        // `auto_page_size` in app.rs assumes this footer is exactly 3rem tall:
+        // `py_3` around small controls. Keep the two in sync.
         h_flex()
             .flex_shrink_0()
-            .justify_center()
             .items_center()
+            .justify_between()
             .gap_3()
+            .px_5()
             .py_3()
             .border_t_1()
             .border_color(p.line)
-            .child(previous)
             .child(
                 div()
                     .font_family(MONO_FONT)
                     .text_xs()
                     .text_color(p.ink_muted)
-                    .child(format!("PAGE {} OF {}", self.page + 1, total_pages)),
+                    .child(format!("SHOWING {first}–{last} OF {count}")),
             )
-            .child(next)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_3()
+                    .child(previous)
+                    .child(
+                        div()
+                            .font_family(MONO_FONT)
+                            .text_xs()
+                            .text_color(p.ink_muted)
+                            .child(format!("PAGE {} OF {}", page + 1, total_pages)),
+                    )
+                    .child(next),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(field_label("PER PAGE", p.ink_muted))
+                    .child(div().w(px(104.0)).child(page_size_select)),
+            )
     }
 
     fn render_inline_editor(&mut self, cx: &mut gpui_kit::Context<Self>) -> impl IntoElement {
@@ -1184,6 +1223,21 @@ impl SoundboardApp {
 
         let renaming = self.rename_target == Some(id);
         let volume_slider = self.volume_sliders.get(&id).cloned();
+        // The pad overlay owns every click above the volume row. It needs the
+        // waveform bounds so a click there can seek instead of toggling.
+        let waveform_seek = sound.is_ready() && !renaming;
+        let waveform_bounds: Rc<Cell<Option<Bounds<gpui_kit::Pixels>>>> = Rc::new(Cell::new(None));
+        // The point under the pointer previews the seek: the row grows and the
+        // bars up to the pointer light up.
+        let waveform_hover = if waveform_seek {
+            self.waveform_hover
+                .filter(|hover| hover.sound_id == id)
+                .map(|hover| hover.ratio)
+        } else {
+            None
+        };
+        let duration_seconds = sound.duration();
+        let hover_time = waveform_hover.map(|ratio| format_time_precise(duration_seconds * ratio));
         let content = div()
             .size_full()
             .p_4()
@@ -1225,8 +1279,12 @@ impl SoundboardApp {
                         div()
                             .font_family(MONO_FONT)
                             .text_xs()
-                            .text_color(p.cream_muted)
-                            .child(duration),
+                            .text_color(if hover_time.is_some() {
+                                p.cream
+                            } else {
+                                p.cream_muted
+                            })
+                            .child(hover_time.clone().unwrap_or_else(|| duration.clone())),
                     ),
             )
             .child(if renaming {
@@ -1279,43 +1337,80 @@ impl SoundboardApp {
                     })
                     .into_any_element()
             })
-            .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .h_6()
-                    .w_full()
-                    .items_end()
-                    .gap_1()
-                    .when(failed, |this| {
-                        this.child(
-                            div()
-                                .font_family(MONO_FONT)
-                                .text_xs()
-                                .text_color(p.signal)
-                                .child(match &sound.status {
-                                    SoundStatus::Failed(error) => error.clone(),
-                                    _ => SharedString::from("Read error"),
-                                }),
+            .child({
+                if failed {
+                    let error = match &sound.status {
+                        SoundStatus::Failed(error) => error.clone(),
+                        _ => SharedString::from("Read error"),
+                    };
+                    div()
+                        .relative()
+                        .flex_shrink_0()
+                        .h_6()
+                        .w_full()
+                        .child(
+                            h_flex().size_full().items_end().gap_1().child(
+                                div()
+                                    .font_family(MONO_FONT)
+                                    .text_xs()
+                                    .text_color(p.signal)
+                                    .child(error),
+                            ),
                         )
-                    })
-                    .when(!failed, |this| {
-                        this.children(waveform.iter().enumerate().map(|(bar, peak)| {
-                            let lit = playing && (bar as f32 / waveform.len() as f32) <= progress;
-                            div()
-                                .flex_1()
-                                .min_w(px(1.0))
-                                .h(px(3.0 + peak.clamp(0.0, 1.0) * 21.0))
-                                .rounded_full()
-                                .bg(if lit {
-                                    p.signal
-                                } else if playing {
-                                    p.cream_muted.opacity(0.28)
+                        .into_any_element()
+                } else {
+                    let peaks = waveform.clone();
+                    let grow_target = if waveform_hover.is_some() {
+                        px(1.0)
+                    } else {
+                        px(0.0)
+                    };
+                    let seek_bounds = waveform_seek.then(|| waveform_bounds.clone());
+                    div()
+                        .relative()
+                        .flex_shrink_0()
+                        .w_full()
+                        // The spring keeps the zoom smooth even when the pointer
+                        // leaves before the row has finished growing.
+                        .with_spring(
+                            ("waveform-grow", id),
+                            SpringAnimation::new(WAVEFORM_GROW_SPRING)
+                                .to(grow_target)
+                                .with_epsilon(0.004),
+                            move |row, grow: gpui_kit::Pixels| {
+                                let grow = f32::from(grow).clamp(0.0, 1.0);
+                                let row = row
+                                    .h(rems(WAVEFORM_ROW_REMS + WAVEFORM_GROW_REMS * grow))
+                                    .child(waveform_band(
+                                        &peaks,
+                                        playing,
+                                        progress,
+                                        waveform_hover,
+                                        grow,
+                                        p,
+                                    ));
+                                if let Some(bounds_store) = seek_bounds.clone() {
+                                    row.child(
+                                        // The canvas only reports the row bounds
+                                        // so a click can be turned into a clip
+                                        // position.
+                                        canvas(
+                                            |bounds, _, _| bounds,
+                                            move |bounds, _, _, _| {
+                                                bounds_store.set(Some(bounds));
+                                            },
+                                        )
+                                        .absolute()
+                                        .inset_0(),
+                                    )
                                 } else {
-                                    p.cream_muted.opacity(0.45)
-                                })
-                        }))
-                    }),
-            )
+                                    row
+                                }
+                            },
+                        )
+                        .into_any_element()
+                }
+            })
             .child(div().flex_1())
             .child(
                 h_flex()
@@ -1426,6 +1521,12 @@ impl SoundboardApp {
         let interaction_layer = if renaming {
             div().into_any_element()
         } else {
+            let waveform_bounds = waveform_bounds.clone();
+            let cursor = if waveform_hover.is_some() {
+                CursorStyle::ResizeLeftRight
+            } else {
+                CursorStyle::PointingHand
+            };
             div()
                 .id(("sound-interaction", id))
                 .absolute()
@@ -1433,8 +1534,19 @@ impl SoundboardApp {
                 .left_0()
                 .right_0()
                 .bottom(px(38.0))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, window, cx| {
+                .cursor(cursor)
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    let position = match event {
+                        ClickEvent::Mouse(event) => Some(event.down.position),
+                        ClickEvent::Touch(event) => Some(event.position),
+                        ClickEvent::Keyboard(_) => None,
+                    };
+                    if let (Some(position), Some(bounds)) = (position, waveform_bounds.get())
+                        && let Some(ratio) = super::waveform_seek_ratio(&bounds, position)
+                    {
+                        this.seek_from_waveform(id, ratio, window, cx);
+                        return;
+                    }
                     this.activate_sound(id, window, cx);
                 }))
                 .on_drag(TileDrag { id }, {
@@ -1524,6 +1636,29 @@ impl SoundboardApp {
                 if this.hovered_sound != next {
                     this.hovered_sound = next;
                     cx.notify();
+                }
+                // Leaving the pad ends the preview even when the pointer exits
+                // through a gap that produces no further move events.
+                if !*is_hovered
+                    && this
+                        .waveform_hover
+                        .is_some_and(|hover| hover.sound_id == id)
+                {
+                    this.clear_waveform_hover(cx);
+                }
+            }))
+            .on_mouse_move(cx.listener({
+                let waveform_bounds = waveform_bounds.clone();
+                move |this, event: &MouseMoveEvent, _, cx| {
+                    // While a button is held the pad is being dragged, not
+                    // scrubbed: leave the preview where the press landed.
+                    if !waveform_seek || event.pressed_button.is_some() {
+                        return;
+                    }
+                    let ratio = waveform_bounds
+                        .get()
+                        .and_then(|bounds| super::waveform_seek_ratio(&bounds, event.position));
+                    this.preview_waveform_hover(id, ratio, cx);
                 }
             }));
 
@@ -2456,6 +2591,74 @@ fn placeholder_waveform() -> Vec<f32> {
     (0..28)
         .map(|index| 0.2 + ((index as f32 * 0.7).sin().abs() * 0.5))
         .collect()
+}
+
+/// Height of the pad waveform band at rest (`h_6`) and the extra height the
+/// hover zoom adds to it.
+const WAVEFORM_ROW_REMS: f32 = 1.5;
+const WAVEFORM_GROW_REMS: f32 = 1.1;
+
+/// Critically damped spring behind the hover zoom: about a fifth of a second
+/// to settle, without a bounce that would outgrow the free space in the pad.
+const WAVEFORM_GROW_SPRING: SpringConfig = SpringConfig::new(900.0, 60.0, 1.0);
+
+/// The pad waveform band.
+///
+/// `grow` scales the band from its resting size (0) to the hovered size (1),
+/// and `hover` is the position under the pointer: the bars up to it light up
+/// in the seek colour and a playhead marks the exact point a click would hit.
+fn waveform_band(
+    peaks: &[f32],
+    playing: bool,
+    progress: f32,
+    hover: Option<f32>,
+    grow: f32,
+    p: &'static Palette,
+) -> impl IntoElement {
+    let count = peaks.len();
+    let idle_alpha = if playing {
+        0.28 - 0.06 * grow
+    } else {
+        0.45 - 0.12 * grow
+    };
+    let preview_alpha = 0.55 + 0.45 * grow;
+    let height_scale = 1.0 + 0.62 * grow;
+    h_flex()
+        .relative()
+        .size_full()
+        .items_end()
+        .gap_1()
+        .children(peaks.iter().enumerate().map(move |(bar, peak)| {
+            let played = super::waveform_bar_filled(bar, count, progress);
+            let previewed =
+                hover.is_some_and(|ratio| super::waveform_bar_filled(bar, count, ratio));
+            let color = if playing && played {
+                p.signal
+            } else if previewed {
+                p.blue.opacity(preview_alpha)
+            } else {
+                p.cream_muted.opacity(idle_alpha)
+            };
+            div()
+                .flex_1()
+                .min_w(px(1.0))
+                .h(rems((0.2 + peak.clamp(0.0, 1.0) * 1.4) * height_scale))
+                .rounded_full()
+                .bg(color)
+        }))
+        .when_some(hover, move |this, ratio| {
+            this.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(relative(ratio))
+                    .ml(px(-1.0))
+                    .w(px(2.0))
+                    .rounded_full()
+                    .bg(p.cream.opacity(0.45 + 0.55 * grow)),
+            )
+        })
 }
 
 /// A compact analog VU face. The scale, tick rails and both needles are painted
