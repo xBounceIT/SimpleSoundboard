@@ -149,10 +149,10 @@ Releases are automated: [`.github/workflows/release.yml`](.github/workflows/rele
 Before tagging, the `version` in `Cargo.toml` must match the tag: the workflow refuses to publish if they differ.
 
 ```powershell
-# Cargo.toml: version = "1.0.0"
+# Cargo.toml: version = "1.0.1"
 git add .
-git commit -m "Release v1.0.0"
-git tag v1.0.0
+git commit -m "Release v1.0.1"
+git tag v1.0.1
 git push origin main --tags
 ```
 
@@ -160,8 +160,8 @@ To build the setup locally, install [Inno Setup 6](https://jrsoftware.org/isinfo
 
 ```powershell
 cargo build --release
-& 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer\simple-soundboard.iss /DAppVersion=1.0.0
-# dist\SimpleSoundboard-Setup-1.0.0.exe
+& 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer\simple-soundboard.iss /DAppVersion=1.0.1
+# dist\SimpleSoundboard-Setup-1.0.1.exe
 ```
 
 ## Limitations
