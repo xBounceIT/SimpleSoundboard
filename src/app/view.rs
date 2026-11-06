@@ -2229,17 +2229,12 @@ impl SoundboardApp {
             .w_full()
             .gap_3()
             .child(
-                v_flex()
-                    .gap_1()
-                    .child(section_label("SETTINGS", p.ink_muted))
-                    .child(
-                        div()
-                            .font_family(DISPLAY_FONT)
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(p.cream)
-                            .child("Settings"),
-                    ),
+                div()
+                    .font_family(DISPLAY_FONT)
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.cream)
+                    .child("Settings"),
             )
             .child(
                 h_flex()
