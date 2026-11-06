@@ -2237,24 +2237,12 @@ impl SoundboardApp {
                     .child("Settings"),
             )
             .child(
-                h_flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .font_family(MONO_FONT)
-                            .text_xs()
-                            .text_color(p.cream_muted)
-                            .child(update::CURRENT_TAG),
-                    )
-                    .child(
-                        Button::new("close-settings")
-                            .label("Back to the board")
-                            .icon(Icon::new(AppIcon::ArrowLeft))
-                            .small()
-                            .ghost()
-                            .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
-                    ),
+                Button::new("close-settings")
+                    .label("Back to the board")
+                    .icon(Icon::new(AppIcon::ArrowLeft))
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
             );
 
         let nav = self.render_settings_nav(cx);
