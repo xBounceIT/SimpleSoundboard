@@ -16,10 +16,13 @@ A desktop audio console for routing clips and voice into a virtual microphone, b
 - Choose the audio output that receives the mix: a virtual cable, an audio interface or a mixer.
 - Choose the physical microphone and, with **Mix my voice**, blend the voice into the clips.
 - **Headphone monitor**: hear the same mix in headphones even when the main output goes to Discord.
+- **Headphones only**: keep the clips on the headphones and leave the virtual microphone to your voice, so nothing from the bank reaches the call.
+- **Settings page**: check for updates, install them and read the release notes in a dedicated panel, all without leaving the app.
+- **Overlapping sounds** (off by default): let pads stack on top of each other instead of interrupting the previous clip.
 - Shows a two-needle analog VU meter for the output and a signal indicator for the microphone.
 - Controls: previous, play/pause, stop, next, loop, seek, master volume and **independent volume per pad**.
-- Remembers the bank, names, trims, volumes, devices, monitor and page size in `%APPDATA%\SimpleSoundboard\state.json`. Development builds use a separate profile in `%APPDATA%\SimpleSoundboard-Dev\state.json`.
-- Checks for updates on every launch and, when a newer version exists, shows a bottom-right notification with **Update now** and **See changes**.
+- Remembers the bank, names, trims, volumes, devices, monitor, headphones-only route and page size in `%APPDATA%\SimpleSoundboard\state.json`. Development builds use a separate profile in `%APPDATA%\SimpleSoundboard-Dev\state.json`.
+- Checks for updates on every launch and, when a newer version exists, shows a bottom-right notification with **Update now** and **See changes**; the second opens the settings page on the release notes.
 
 ## Routing to Discord
 
@@ -29,7 +32,8 @@ On Windows an application cannot write directly into the stream of a physical mi
 2. In SimpleSoundboard open **SOUND OUTPUT** and choose the cable's input side, for example `CABLE Input`.
 3. In **HEADPHONE MONITOR** choose your headphones. When the output is virtual, the monitor is enabled automatically on a physical device, preferring headphones; select `None` to turn it off.
 4. Enable **Mix my voice** if you want the microphone and the clips on the same channel.
-5. In the target app — Discord, OBS, Teams, a browser — choose the cable's output side as the microphone, for example `CABLE Output`.
+5. Enable **Headphones only** to rehearse a clip without sending it: the bank goes to the headphones and the microphone keeps only your voice. It needs a headphone monitor and turns itself off when the monitor is removed.
+6. In the target app — Discord, OBS, Teams, a browser — choose the cable's output side as the microphone, for example `CABLE Output`.
 
 The signal stays on the computer: no file is uploaded to a cloud service.
 
@@ -96,6 +100,17 @@ The app uses these crates:
 - `ureq` — GitHub release check and setup download.
 - `serde`/`serde_json` — local state and GitHub response parsing.
 
+## Settings
+
+The gear in the title bar opens a settings page, with **Esc** or **Back to the board** to leave it.
+
+- **UPDATES** shows the installed version next to the latest published one, the state of the check and two actions: **Check for updates** asks GitHub again, **Install update** downloads the setup, verifies it is a Windows executable, runs it silently and closes the app while it replaces the files.
+- **CHANGES** renders the release notes of the latest release — headings, bullet points and the full-changelog link — in a scrollable panel, so the notes are readable without opening a browser. **Open on GitHub** is there when you want the full page.
+- **PREFERENCES** holds the behaviour switches. **Overlapping sounds** lets a new pad start without stopping the one on air: every pad keeps its own voice, the pad that was triggered again restarts, and the transport follows the newest voice — when it ends, the bar moves to whichever pad is still playing. Leaving it off keeps the classic exclusive cue.
+- **ABOUT** lists the version, whether the build is a development or release one, and the `state.json` the bank is saved to.
+
+A check failure (no network, GitHub down) is reported in the card instead of interrupting the soundboard: the bank and the transport keep working while the page is open.
+
 ## Commands
 
 | Command | Shortcut |
@@ -115,7 +130,7 @@ Transport commands are available from the buttons with mouse and keyboard. The w
 - The monitor buffer is about 40 ms; the microphone is buffered for about 30 ms.
 - The VU meter is drawn with GPUI's vector canvas.
 - Output and monitor are selected by name. If a device is no longer available, the app falls back to the default or disables the monitor.
-- A new clip stops all previous voices: the sound on air is always the last one triggered.
+- A new clip stops all previous voices unless **Overlapping sounds** is on in the settings, in which case each pad keeps its own voice and the transport follows the newest one.
 - The end of a clip always resets the transport, even when the last block comes from a WAV with a different sample rate than the output.
 
 ## Development
@@ -126,7 +141,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-The 22 tests cover WAV and MP3 decoding, mixing, pause, loop, end of voice (including WAV files at a different sample rate), trigger exclusivity, audio trimming, the monitor buffer, device preferences, virtual device detection, version comparison, setup asset selection and keyboard shortcut validation.
+The 34 tests cover WAV and MP3 decoding, mixing, pause, loop, end of voice (including WAV files at a different sample rate), trigger exclusivity and polyphonic stacking, audio trimming, the monitor buffer, headphones-only routing, the library layout, release-note parsing, device preferences, virtual device detection, version comparison, setup asset selection and keyboard shortcut validation.
 
 Main structure:
 
@@ -136,8 +151,8 @@ src/theme.rs       palette and theme tokens
 src/model.rs       bank model, trims and formatting
 src/audio.rs       cpal, symphonia, mixer and headphone monitor
 src/app.rs         app state, persistence, actions
-src/app/view.rs    layout, custom title bar, pad wall, routing, transport and update toast
-src/update.rs      GitHub release, setup download and launch
+src/app/view.rs    layout, custom title bar, pad wall, routing, transport, settings page and update toast
+src/update.rs      GitHub release, release notes, setup download and launch
 installer/         Inno Setup script for the Windows setup
 .github/workflows/release.yml  build and publish the release on vX.Y.Z tags
 ```
@@ -149,10 +164,10 @@ Releases are automated: [`.github/workflows/release.yml`](.github/workflows/rele
 Before tagging, the `version` in `Cargo.toml` must match the tag: the workflow refuses to publish if they differ.
 
 ```powershell
-# Cargo.toml: version = "1.0.1"
+# Cargo.toml: version = "1.1.0"
 git add .
-git commit -m "Release v1.0.1"
-git tag v1.0.1
+git commit -m "Release v1.1.0"
+git tag v1.1.0
 git push origin main --tags
 ```
 
@@ -160,8 +175,8 @@ To build the setup locally, install [Inno Setup 6](https://jrsoftware.org/isinfo
 
 ```powershell
 cargo build --release
-& 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer\simple-soundboard.iss /DAppVersion=1.0.1
-# dist\SimpleSoundboard-Setup-1.0.1.exe
+& 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer\simple-soundboard.iss /DAppVersion=1.1.0
+# dist\SimpleSoundboard-Setup-1.1.0.exe
 ```
 
 ## Limitations

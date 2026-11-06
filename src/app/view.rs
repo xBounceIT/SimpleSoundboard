@@ -40,6 +40,24 @@ impl Render for SoundboardApp {
         cx: &mut gpui_kit::Context<Self>,
     ) -> impl IntoElement {
         let p = palette();
+        let body = if self.settings_open {
+            self.render_settings(cx)
+        } else {
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .items_stretch()
+                .child(self.render_library(window, cx))
+                .child(self.render_routing(cx))
+                .into_any_element()
+        };
+        let toast = if self.settings_open {
+            div().into_any_element()
+        } else {
+            self.render_update_toast(cx)
+        };
+
         div()
             .id("soundboard")
             .relative()
@@ -64,17 +82,9 @@ impl Render for SoundboardApp {
                 this.add_paths(paths.0.to_vec(), window, cx);
             }))
             .child(self.render_title_bar(window, cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .items_stretch()
-                    .child(self.render_library(window, cx))
-                    .child(self.render_routing(cx)),
-            )
+            .child(body)
             .child(self.render_transport(cx))
-            .child(self.render_update_toast(cx))
+            .child(toast)
             .child(self.render_shortcut_capture(cx))
     }
 }
@@ -195,7 +205,9 @@ impl SoundboardApp {
             .label("See changes")
             .ghost()
             .small()
-            .on_click(cx.listener(|this, _, _, cx| this.open_update_notes(cx)));
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.show_release_notes(window, cx);
+            }));
 
         div()
             .absolute()
@@ -316,12 +328,24 @@ impl SoundboardApp {
                             .child(Icon::new(AppIcon::AudioLines).size_5().text_color(p.cream)),
                     )
                     .child(
-                        div()
-                            .font_family(DISPLAY_FONT)
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(p.cream)
-                            .child("SimpleSoundboard"),
+                        h_flex()
+                            .items_baseline()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .font_family(DISPLAY_FONT)
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.cream)
+                                    .child("SimpleSoundboard"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(MONO_FONT)
+                                    .text_xs()
+                                    .text_color(p.cream_muted)
+                                    .child(update::CURRENT_TAG),
+                            ),
                     )
                     .when(cfg!(debug_assertions), |this| {
                         this.child(
@@ -373,9 +397,36 @@ impl SoundboardApp {
             WindowControlAction::Close,
         );
 
+        let settings = Button::new("open-settings")
+            .icon(
+                Icon::new(AppIcon::Settings)
+                    .size_3p5()
+                    .text_color(if self.settings_open { p.amber } else { p.cream }),
+            )
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .color(if self.settings_open {
+                        p.console_hi
+                    } else {
+                        p.console
+                    })
+                    .foreground(p.cream)
+                    .hover(p.console_hi)
+                    .active(p.console_line),
+            )
+            .w_12()
+            .h_full()
+            .p_0()
+            .rounded(px(0.0))
+            .tab_stop(false)
+            .accessibility_label("Settings")
+            .tooltip("Settings · updates and release notes")
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx)));
+
         let controls = h_flex()
             .h_full()
             .flex_shrink_0()
+            .child(settings)
             .child(minimize)
             .child(maximize)
             .child(close);
@@ -403,6 +454,7 @@ impl SoundboardApp {
         let body = if self.sounds.is_empty() {
             self.render_empty_state(cx).into_any_element()
         } else {
+            let metrics = super::LibraryMetrics::for_window(window);
             let per_page = self.per_page(window).max(1);
             let filtered = self.filtered_sound_indices();
             let total_pages = filtered.len().div_ceil(per_page).max(1);
@@ -414,7 +466,8 @@ impl SoundboardApp {
             let list = if filtered.is_empty() {
                 self.render_no_results(cx).into_any_element()
             } else {
-                self.render_grid(&page_indices, cx).into_any_element()
+                self.render_grid(&page_indices, metrics.tile_width, cx)
+                    .into_any_element()
             };
             let count = filtered.len();
 
@@ -1132,6 +1185,7 @@ impl SoundboardApp {
     fn render_grid(
         &mut self,
         indices: &[usize],
+        tile_width: f32,
         cx: &mut gpui_kit::Context<Self>,
     ) -> impl IntoElement {
         let p = palette();
@@ -1141,7 +1195,10 @@ impl SoundboardApp {
             .collect();
         let mut tiles = Vec::with_capacity(sounds.len());
         for (index, sound) in sounds.iter() {
-            tiles.push(self.render_sound_tile(*index, sound, cx).into_any_element());
+            tiles.push(
+                self.render_sound_tile(*index, sound, tile_width, cx)
+                    .into_any_element(),
+            );
         }
 
         div()
@@ -1169,6 +1226,7 @@ impl SoundboardApp {
         &mut self,
         index: usize,
         sound: &Sound,
+        tile_width: f32,
         cx: &mut gpui_kit::Context<Self>,
     ) -> impl IntoElement {
         let p = palette();
@@ -1622,7 +1680,7 @@ impl SoundboardApp {
 
         let wrapper = div()
             .id(("sound-wrap", id))
-            .w(relative(0.32))
+            .w(px(tile_width))
             .h_48()
             .flex_shrink_0()
             .on_hover(cx.listener(move |this, is_hovered, _, cx| {
@@ -1934,6 +1992,57 @@ impl SoundboardApp {
                     ),
             );
 
+        let headphones_only = h_flex()
+            .w_full()
+            .justify_between()
+            .items_center()
+            .gap_2()
+            .border_t_1()
+            .border_color(p.line)
+            .pt_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .v_flex()
+                    .gap_0()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.ink)
+                            .child("Headphones only"),
+                    )
+                    .child(
+                        div()
+                            .font_family(MONO_FONT)
+                            .text_xs()
+                            .line_height(relative(1.25))
+                            .text_color(if self.headphones_only {
+                                p.green
+                            } else {
+                                p.ink_muted
+                            })
+                            .child(if self.headphones_only {
+                                "SOUNDS SKIP THE VIRTUAL MIC"
+                            } else {
+                                "Sounds also go to the virtual mic"
+                            }),
+                    ),
+            )
+            .child(
+                div().flex_shrink_0().child(
+                    Switch::new("headphones-only")
+                        .checked(self.headphones_only)
+                        .disabled(!monitor_active)
+                        .accessibility_label("Play the sounds on the headphones only")
+                        .on_change(cx.listener(|this, checked, window, cx| {
+                            this.toggle_headphones_only(*checked, window, cx);
+                        })),
+                ),
+            );
+
         let voice_mix = h_flex()
             .w_full()
             .justify_between()
@@ -1989,6 +2098,7 @@ impl SoundboardApp {
             .child(div().h(px(1.0)).w_full().bg(p.line))
             .child(input_block)
             .child(monitor_block)
+            .child(headphones_only)
             .child(voice_mix);
 
         let error_note = self.audio_error.as_ref().map(|error| {
@@ -2068,7 +2178,9 @@ impl SoundboardApp {
                             .font_family(MONO_FONT)
                             .text_xs()
                             .text_color(p.cream_muted)
-                            .child(if output_virtual {
+                            .child(if self.headphones_only {
+                                "HEADPHONES ONLY"
+                            } else if output_virtual {
                                 "ROUTING ACTIVE"
                             } else {
                                 "MONITOR ONLY"
@@ -2101,6 +2213,389 @@ impl SoundboardApp {
                             .child(meter_card),
                     ),
             )
+    }
+
+    fn render_settings(&mut self, cx: &mut gpui_kit::Context<Self>) -> AnyElement {
+        let p = palette();
+        let release = self.latest_release.clone();
+        let newer = release.as_ref().is_some_and(|release| release.is_newer());
+        let downloading = self.update_downloading;
+        let installable = self.available_update.is_some() && !downloading;
+
+        let (status, status_color) = if self.checking_updates {
+            (
+                "Checking GitHub for the latest release…".to_string(),
+                p.ink_muted,
+            )
+        } else if let Some(error) = &self.update_check_error {
+            (error.to_string(), p.signal)
+        } else if let Some(release) = &release {
+            if newer {
+                if release.setup.is_some() {
+                    (
+                        format!(
+                            "v{} is ready: download it and the setup does the rest.",
+                            release.version
+                        ),
+                        p.green,
+                    )
+                } else {
+                    (
+                        format!("v{} is published without a Windows setup.", release.version),
+                        p.amber,
+                    )
+                }
+            } else {
+                (
+                    format!(
+                        "You are on the latest release, v{}.",
+                        update::CURRENT_VERSION
+                    ),
+                    p.ink_muted,
+                )
+            }
+        } else {
+            ("No release found on GitHub yet.".to_string(), p.ink_muted)
+        };
+
+        let installed_row = v_flex()
+            .gap_0p5()
+            .child(field_label("INSTALLED", p.ink_muted))
+            .child(
+                div()
+                    .font_family(MONO_FONT)
+                    .text_sm()
+                    .text_color(p.ink)
+                    .child(update::CURRENT_TAG),
+            );
+
+        let latest_row = v_flex()
+            .gap_0p5()
+            .child(field_label("LATEST", p.ink_muted))
+            .child(
+                div()
+                    .font_family(MONO_FONT)
+                    .text_sm()
+                    .text_color(if newer { p.green } else { p.ink })
+                    .child(match &release {
+                        Some(release) => format!("v{}", release.version),
+                        None => "—".to_string(),
+                    }),
+            );
+
+        let check_button = Button::new("check-updates")
+            .label(if self.checking_updates {
+                "Checking…"
+            } else {
+                "Check for updates"
+            })
+            .icon(Icon::new(AppIcon::RefreshCw))
+            .small()
+            .ghost()
+            .disabled(self.checking_updates || downloading)
+            .on_click(cx.listener(|this, _, window, cx| this.check_updates(window, cx)));
+
+        let install_button = Button::new("install-update")
+            .label(if downloading {
+                "Downloading…"
+            } else {
+                "Install update"
+            })
+            .icon(Icon::new(AppIcon::CircleCheck))
+            .primary()
+            .small()
+            .disabled(!installable)
+            .on_click(cx.listener(|this, _, window, cx| this.install_update(window, cx)));
+
+        let preferences_card = settings_card(
+            cx,
+            "PREFERENCES",
+            v_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(p.ink)
+                                        .child("Overlapping sounds"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_xs()
+                                        .line_height(relative(1.25))
+                                        .text_color(if self.polyphonic {
+                                            p.green
+                                        } else {
+                                            p.ink_muted
+                                        })
+                                        .child(if self.polyphonic {
+                                            "PADS PLAY ON TOP OF EACH OTHER"
+                                        } else {
+                                            "A NEW PAD STOPS THE PREVIOUS ONE"
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div().flex_shrink_0().child(
+                                Switch::new("polyphonic")
+                                    .checked(self.polyphonic)
+                                    .accessibility_label("Play pads on top of each other")
+                                    .on_change(cx.listener(|this, checked, _, cx| {
+                                        this.toggle_polyphonic(*checked, cx);
+                                    })),
+                            ),
+                        ),
+                )
+                .into_any_element(),
+        );
+
+        let updates_card = settings_card(
+            cx,
+            "UPDATES",
+            v_flex()
+                .gap_3()
+                .child(h_flex().gap_6().child(installed_row).child(latest_row))
+                .child(
+                    div()
+                        .text_sm()
+                        .line_height(relative(1.4))
+                        .text_color(status_color)
+                        .child(status),
+                )
+                .when_some(self.update_error.as_ref(), |this, error| {
+                    this.child(
+                        div()
+                            .rounded(cx.theme().radius)
+                            .border_1()
+                            .border_color(p.signal.opacity(0.4))
+                            .bg(p.signal_soft)
+                            .px_3()
+                            .py_2()
+                            .text_xs()
+                            .line_height(relative(1.4))
+                            .text_color(p.cream)
+                            .child(error.clone()),
+                    )
+                })
+                .child(h_flex().gap_2().child(check_button).child(install_button))
+                .into_any_element(),
+        );
+
+        let profile = super::state_path()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Not available".to_string());
+        let about_card = settings_card(
+            cx,
+            "ABOUT",
+            v_flex()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .gap_6()
+                        .child(
+                            v_flex()
+                                .gap_0p5()
+                                .child(field_label("VERSION", p.ink_muted))
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_sm()
+                                        .text_color(p.ink)
+                                        .child(update::CURRENT_TAG),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_0p5()
+                                .child(field_label("BUILD", p.ink_muted))
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_sm()
+                                        .text_color(if cfg!(debug_assertions) {
+                                            p.amber
+                                        } else {
+                                            p.ink
+                                        })
+                                        .child(if cfg!(debug_assertions) {
+                                            "Development"
+                                        } else {
+                                            "Release"
+                                        }),
+                                ),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .gap_0p5()
+                        .child(field_label("SETTINGS FILE", p.ink_muted))
+                        .child(
+                            div()
+                                .font_family(MONO_FONT)
+                                .text_xs()
+                                .line_height(relative(1.35))
+                                .text_color(p.ink_muted)
+                                .child(profile),
+                        ),
+                )
+                .into_any_element(),
+        );
+
+        let changes_title = release
+            .as_ref()
+            .map(|release| release.title.clone())
+            .unwrap_or_else(|| "Release notes".to_string());
+        let changes_meta = match &release {
+            Some(release) => match release
+                .published_at
+                .as_deref()
+                .and_then(|stamp| stamp.get(..10))
+            {
+                Some(date) => format!("v{} · published {date}", release.version),
+                None => format!("v{}", release.version),
+            },
+            None => "Nothing to show yet".to_string(),
+        };
+
+        let open_on_github = Button::new("open-release")
+            .label("Open on GitHub")
+            .icon(Icon::new(AppIcon::ExternalLink))
+            .small()
+            .ghost()
+            .disabled(release.is_none())
+            .on_click(cx.listener(|this, _, _, cx| this.open_release_page(cx)));
+
+        let notes: AnyElement = if self.checking_updates && release.is_none() {
+            settings_placeholder("Checking GitHub…", p.ink_muted)
+        } else if let Some(error) = &self.update_check_error {
+            settings_placeholder(error.to_string(), p.signal)
+        } else if let Some(release) = &release {
+            if release.notes.trim().is_empty() {
+                settings_placeholder("This release has no notes.", p.ink_muted)
+            } else {
+                release_notes_body(&release.notes)
+            }
+        } else {
+            settings_placeholder(
+                "No published release to read. Publish one on GitHub and press Check for updates.",
+                p.ink_muted,
+            )
+        };
+
+        let changes_card = div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .v_flex()
+            .gap_3()
+            .rounded(cx.theme().radius_lg)
+            .border_1()
+            .border_color(p.line)
+            .bg(p.paper_hi)
+            .p_3()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_start()
+                    .gap_3()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .child(section_label("CHANGES", p.ink_muted))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .font_family(DISPLAY_FONT)
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.ink)
+                                    .child(changes_title),
+                            )
+                            .child(
+                                div()
+                                    .font_family(MONO_FONT)
+                                    .text_xs()
+                                    .text_color(p.ink_muted)
+                                    .child(changes_meta),
+                            ),
+                    )
+                    .child(open_on_github),
+            )
+            .child(
+                div()
+                    .id("release-notes")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scrollbar()
+                    .child(notes),
+            );
+
+        let header = h_flex()
+            .justify_between()
+            .items_end()
+            .w_full()
+            .gap_3()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(section_label("SETTINGS", p.ink_muted))
+                    .child(
+                        div()
+                            .font_family(DISPLAY_FONT)
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.cream)
+                            .child("Preferences, updates and release notes"),
+                    ),
+            )
+            .child(
+                Button::new("close-settings")
+                    .label("Back to the board")
+                    .icon(Icon::new(AppIcon::ArrowLeft))
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
+            );
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .bg(p.paper)
+            .px_5()
+            .py_4()
+            .child(header)
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_stretch()
+                    .gap_4()
+                    .child(
+                        v_flex()
+                            .w(px(360.0))
+                            .flex_shrink_0()
+                            .gap_4()
+                            .child(preferences_card)
+                            .child(updates_card)
+                            .child(about_card),
+                    )
+                    .child(changes_card),
+            )
+            .into_any_element()
     }
 
     fn render_transport(&mut self, cx: &mut gpui_kit::Context<Self>) -> impl IntoElement {
@@ -2538,6 +3033,130 @@ fn field_label(label: &'static str, color: Hsla) -> impl IntoElement {
         .text_xs()
         .text_color(color)
         .child(label)
+}
+
+/// A titled, bordered card used by the settings page.
+fn settings_card(
+    cx: &mut gpui_kit::Context<SoundboardApp>,
+    title: &'static str,
+    body: AnyElement,
+) -> AnyElement {
+    let p = palette();
+    div()
+        .w_full()
+        .v_flex()
+        .gap_2()
+        .rounded(cx.theme().radius_lg)
+        .border_1()
+        .border_color(p.line)
+        .bg(p.paper_hi)
+        .p_3()
+        .child(section_label(title, p.ink_muted))
+        .child(body)
+        .into_any_element()
+}
+
+fn settings_placeholder(message: impl Into<SharedString>, color: Hsla) -> AnyElement {
+    div()
+        .w_full()
+        .text_sm()
+        .line_height(relative(1.4))
+        .text_color(color)
+        .child(message.into())
+        .into_any_element()
+}
+
+/// A line of release notes, after the light markdown GitHub lets authors use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ReleaseNote {
+    Heading(String),
+    Bullet(String),
+    Text(String),
+}
+
+/// Split a release body into the pieces the settings page renders.
+pub(super) fn release_note_lines(body: &str) -> Vec<ReleaseNote> {
+    let mut notes = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "---" || trimmed == "***" {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            let heading = strip_note_markup(trimmed.trim_start_matches('#').trim());
+            if !heading.is_empty() {
+                notes.push(ReleaseNote::Heading(heading));
+            }
+            continue;
+        }
+        if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            let item = strip_note_markup(item);
+            if !item.is_empty() {
+                notes.push(ReleaseNote::Bullet(item));
+            }
+            continue;
+        }
+        notes.push(ReleaseNote::Text(strip_note_markup(trimmed)));
+    }
+    notes
+}
+
+/// Drop the emphasis markers that would otherwise show up as punctuation.
+fn strip_note_markup(text: &str) -> String {
+    text.replace("**", "")
+        .replace("__", "")
+        .replace('`', "")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn release_notes_body(body: &str) -> AnyElement {
+    let p = palette();
+    let mut rows: Vec<AnyElement> = Vec::new();
+    for note in release_note_lines(body) {
+        rows.push(match note {
+            ReleaseNote::Heading(text) => div()
+                .pt_1()
+                .font_family(MONO_FONT)
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.ink_muted)
+                .child(text)
+                .into_any_element(),
+            ReleaseNote::Bullet(text) => h_flex()
+                .items_start()
+                .gap_2()
+                .child(div().text_sm().text_color(p.ink_muted).child("•"))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .line_height(relative(1.45))
+                        .text_color(p.ink)
+                        .child(text),
+                )
+                .into_any_element(),
+            ReleaseNote::Text(text) => div()
+                .text_sm()
+                .line_height(relative(1.45))
+                .text_color(p.ink)
+                .child(text)
+                .into_any_element(),
+        });
+    }
+
+    div()
+        .w_full()
+        .v_flex()
+        .gap_2()
+        .pb_2()
+        .children(rows)
+        .into_any_element()
 }
 
 fn console_icon_button(

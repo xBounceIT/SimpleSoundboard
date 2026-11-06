@@ -105,6 +105,9 @@ pub struct AudioSnapshot {
     pub output_level_l: f32,
     pub output_level_r: f32,
     pub mic_level: f32,
+    /// Sounds with a voice on air, oldest first. More than one entry only in
+    /// polyphonic mode.
+    pub playing: Vec<SoundId>,
     pub current: Option<TransportSnapshot>,
     pub paused: bool,
 }
@@ -262,6 +265,19 @@ impl MonitorRing {
     }
 }
 
+/// Write one interleaved output frame from a stereo pair.
+fn write_stereo(frame: &mut [f32], left: f32, right: f32) {
+    if frame.len() == 1 {
+        frame[0] = (left + right) * 0.5;
+    } else {
+        frame[0] = left;
+        frame[1] = right;
+        for sample in &mut frame[2..] {
+            *sample = 0.0;
+        }
+    }
+}
+
 struct Mixer {
     voices: Vec<Voice>,
     current: Option<CurrentPlayback>,
@@ -269,6 +285,8 @@ struct Mixer {
     master_volume: f32,
     mic_monitor: bool,
     mic_gain: f32,
+    /// Keep the previous voices alive when a new pad is triggered.
+    polyphonic: bool,
     mic: MicBuffer,
     paused: bool,
     output_rate: u32,
@@ -287,6 +305,7 @@ impl Default for Mixer {
             master_volume: 0.8,
             mic_monitor: false,
             mic_gain: 1.0,
+            polyphonic: false,
             mic: MicBuffer::default(),
             paused: false,
             output_rate: 48_000,
@@ -316,9 +335,15 @@ impl Mixer {
         gain: f32,
         start_ratio: f32,
     ) {
-        // A soundboard cue is exclusive: starting a clip releases the previous
-        // one, so rapid clicks can never stack two cues together.
-        self.voices.clear();
+        if self.polyphonic {
+            // Pads stack: only the pad that was triggered again restarts, so
+            // two different sounds can stay on air together.
+            self.voices.retain(|voice| voice.sound_id != sound_id);
+        } else {
+            // A soundboard cue is exclusive: starting a clip releases the
+            // previous one, so rapid clicks can never stack two cues together.
+            self.voices.clear();
+        }
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1);
         let frames = decoded.frames() as f64;
@@ -376,14 +401,36 @@ impl Mixer {
 
     fn stop_sound(&mut self, sound_id: SoundId) {
         self.voices.retain(|voice| voice.sound_id != sound_id);
+        self.refresh_current();
+    }
+
+    /// Keep the transport on a live voice. When the current one ends, the
+    /// newest surviving voice takes over; with no voices left the transport
+    /// goes idle.
+    fn refresh_current(&mut self) {
+        let Some(current) = &self.current else {
+            return;
+        };
         if self
-            .current
-            .as_ref()
-            .is_some_and(|c| c.sound_id == sound_id)
+            .voices
+            .iter()
+            .any(|voice| voice.token == current.token && !voice.finished)
         {
-            self.current = None;
-            self.paused = false;
+            return;
         }
+        let next = self
+            .voices
+            .iter()
+            .filter(|voice| !voice.finished)
+            .max_by_key(|voice| voice.token)
+            .map(|voice| CurrentPlayback {
+                token: voice.token,
+                sound_id: voice.sound_id,
+                duration: voice.decoded.duration,
+                looping: voice.looping,
+            });
+        self.paused = false;
+        self.current = next;
     }
 
     fn seek_to(&mut self, ratio: f32) {
@@ -416,6 +463,22 @@ impl Mixer {
     }
 
     fn render(&mut self, output: &mut [f32], channels: usize, sample_rate: u32) {
+        self.render_with_voice_bus(output, None, channels, sample_rate);
+    }
+
+    /// Render the full program (sounds + voice) into `output`.
+    ///
+    /// When `voice_bus` is given, the microphone-only mix is written there in
+    /// the same pass, so the transport still advances exactly once. The
+    /// headphones-only route sends `voice_bus` to the virtual microphone and
+    /// keeps `output` — sounds and all — for the headphones.
+    fn render_with_voice_bus(
+        &mut self,
+        output: &mut [f32],
+        mut voice_bus: Option<&mut [f32]>,
+        channels: usize,
+        sample_rate: u32,
+    ) {
         let channels = channels.max(1);
         let frames = output.len() / channels;
         if frames == 0 {
@@ -428,6 +491,9 @@ impl Mixer {
 
         if self.paused {
             output.fill(0.0);
+            if let Some(voice) = voice_bus.as_deref_mut() {
+                voice.fill(0.0);
+            }
             self.level_l *= 0.88;
             self.level_r *= 0.88;
             return;
@@ -439,7 +505,7 @@ impl Mixer {
         let mic_enabled = self.mic_monitor && self.mic_gain > 0.001;
         let mic_gain = self.mic_gain;
 
-        for frame in output.chunks_mut(channels) {
+        for frame_index in 0..frames {
             let mut left = 0.0f32;
             let mut right = 0.0f32;
 
@@ -447,15 +513,15 @@ impl Mixer {
                 if voice.finished {
                     continue;
                 }
-                let frames = voice.decoded.frames();
-                if frames == 0 {
+                let total = voice.decoded.frames();
+                if total == 0 {
                     voice.finished = true;
                     continue;
                 }
                 let pos = voice.position.floor() as usize;
                 let frac = (voice.position - pos as f64) as f32;
-                let index = pos.min(frames - 1);
-                let next = if index + 1 < frames {
+                let index = pos.min(total - 1);
+                let next = if index + 1 < total {
                     index + 1
                 } else if voice.looping {
                     0
@@ -471,19 +537,20 @@ impl Mixer {
                 right += (r0 + (r1 - r0) * frac) * voice.gain;
 
                 voice.position += voice.decoded.sample_rate as f64 / sample_rate as f64;
-                if voice.position >= frames as f64 {
+                if voice.position >= total as f64 {
                     if voice.looping {
-                        voice.position %= frames as f64;
+                        voice.position %= total as f64;
                     } else {
                         voice.finished = true;
                     }
                 }
             }
 
+            let mut mic_sample = 0.0f32;
             if mic_enabled {
-                let mic = self.mic.next_sample() * mic_gain;
-                left += mic;
-                right += mic;
+                mic_sample = self.mic.next_sample() * mic_gain;
+                left += mic_sample;
+                right += mic_sample;
             }
 
             let l = (left * master).clamp(-1.0, 1.0);
@@ -491,15 +558,14 @@ impl Mixer {
             peak_l = peak_l.max(l.abs());
             peak_r = peak_r.max(r.abs());
 
-            match channels {
-                1 => frame[0] = (l + r) * 0.5,
-                _ => {
-                    frame[0] = l;
-                    frame[1] = r;
-                    for sample in &mut frame[2..] {
-                        *sample = 0.0;
-                    }
-                }
+            let start = frame_index * channels;
+            write_stereo(&mut output[start..start + channels], l, r);
+            if let Some(frame) = voice_bus
+                .as_deref_mut()
+                .and_then(|voice| voice.get_mut(start..start + channels))
+            {
+                let mic = (mic_sample * master).clamp(-1.0, 1.0);
+                write_stereo(frame, mic, mic);
             }
         }
 
@@ -507,36 +573,22 @@ impl Mixer {
         self.level_r = peak_r.max(self.level_r * 0.82);
         self.mic_level = (self.mic_level * 0.90).min(2.0);
 
-        if let Some(current) = &self.current {
-            if let Some(voice) = self
-                .voices
-                .iter()
-                .find(|voice| voice.token == current.token && !voice.finished)
-            {
-                let _ = voice;
-            } else {
-                self.current = None;
-                self.paused = false;
-            }
-        }
-
         self.voices.retain(|voice| !voice.finished);
+        self.refresh_current();
     }
 
     fn snapshot(&mut self) -> AudioSnapshot {
-        if self.current.as_ref().is_some_and(|current| {
-            !self
-                .voices
-                .iter()
-                .any(|voice| voice.token == current.token && !voice.finished)
-        }) {
-            self.current = None;
-            self.paused = false;
-        }
+        self.refresh_current();
         AudioSnapshot {
             output_level_l: self.level_l,
             output_level_r: self.level_r,
             mic_level: self.mic_level,
+            playing: self
+                .voices
+                .iter()
+                .filter(|voice| !voice.finished)
+                .map(|voice| voice.sound_id)
+                .collect(),
             current: self.current.as_ref().and_then(|current| {
                 self.voices
                     .iter()
@@ -562,6 +614,8 @@ pub struct AudioEngine {
     monitor_name: Option<String>,
     monitor_ring: Arc<Mutex<MonitorRing>>,
     monitor_active: Arc<AtomicBool>,
+    /// Sounds go to the headphones and the microphone gets only the voice.
+    monitor_only: Arc<AtomicBool>,
 }
 
 impl AudioEngine {
@@ -576,6 +630,7 @@ impl AudioEngine {
             monitor_name: None,
             monitor_ring: Arc::new(Mutex::new(MonitorRing::default())),
             monitor_active: Arc::new(AtomicBool::new(false)),
+            monitor_only: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -589,13 +644,18 @@ impl AudioEngine {
         let sample_rate = config.sample_rate;
         let channels = config.channels;
 
+        let monitor = MonitorRoute {
+            ring: self.monitor_ring.clone(),
+            active: self.monitor_active.clone(),
+            only: self.monitor_only.clone(),
+        };
+
         let stream = match format {
             SampleFormat::F32 => build_output_stream::<f32>(
                 &device,
                 &config,
                 self.mixer.clone(),
-                self.monitor_ring.clone(),
-                self.monitor_active.clone(),
+                monitor.clone(),
                 channels,
                 sample_rate,
             )?,
@@ -603,8 +663,7 @@ impl AudioEngine {
                 &device,
                 &config,
                 self.mixer.clone(),
-                self.monitor_ring.clone(),
-                self.monitor_active.clone(),
+                monitor.clone(),
                 channels,
                 sample_rate,
             )?,
@@ -612,8 +671,7 @@ impl AudioEngine {
                 &device,
                 &config,
                 self.mixer.clone(),
-                self.monitor_ring.clone(),
-                self.monitor_active.clone(),
+                monitor,
                 channels,
                 sample_rate,
             )?,
@@ -799,6 +857,17 @@ impl AudioEngine {
         lock_mixer(&self.mixer).mic_gain = gain.clamp(0.0, 2.0);
     }
 
+    /// Play the soundboard only on the headphones: the virtual microphone
+    /// keeps the voice bus and never receives a sound.
+    pub fn set_headphones_only(&self, enabled: bool) {
+        self.monitor_only.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Let pads stack instead of interrupting the previous one.
+    pub fn set_polyphonic(&self, enabled: bool) {
+        lock_mixer(&self.mixer).polyphonic = enabled;
+    }
+
     pub fn set_current_looping(&self, looping: bool) {
         lock_mixer(&self.mixer).set_current_looping(looping);
     }
@@ -822,20 +891,34 @@ fn lock_monitor(ring: &Arc<Mutex<MonitorRing>>) -> std::sync::MutexGuard<'_, Mon
     ring.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The handles the output stream needs to drive the headphone monitor.
+#[derive(Clone)]
+struct MonitorRoute {
+    ring: Arc<Mutex<MonitorRing>>,
+    active: Arc<AtomicBool>,
+    /// Sounds go to the headphones and the output carries only the voice.
+    only: Arc<AtomicBool>,
+}
+
 fn build_output_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     mixer: Arc<Mutex<Mixer>>,
-    monitor_ring: Arc<Mutex<MonitorRing>>,
-    monitor_active: Arc<AtomicBool>,
+    monitor: MonitorRoute,
     channels: u16,
     sample_rate: u32,
 ) -> Result<Stream>
 where
     T: SizedSample + FromSample<f32>,
 {
+    let MonitorRoute {
+        ring: monitor_ring,
+        active: monitor_active,
+        only: monitor_only,
+    } = monitor;
     let channels = channels.max(1) as usize;
     let mut stereo = vec![0.0f32; 4096 * 2];
+    let mut voice = vec![0.0f32; 4096 * 2];
     let stream = device
         .build_output_stream(
             *config,
@@ -848,20 +931,41 @@ where
                 if stereo.len() < stereo_len {
                     stereo.resize(stereo_len, 0.0);
                 }
+                if voice.len() < stereo_len {
+                    voice.resize(stereo_len, 0.0);
+                }
+
+                // Headphones-only only makes sense while the headphones are
+                // actually playing; without them the program would vanish.
+                let monitor_on = monitor_active.load(Ordering::Relaxed);
+                let headphones_only = monitor_only.load(Ordering::Relaxed) && monitor_on;
 
                 {
                     let mut mixer = lock_mixer(&mixer);
-                    mixer.render(&mut stereo[..stereo_len], 2, sample_rate);
+                    if headphones_only {
+                        mixer.render_with_voice_bus(
+                            &mut stereo[..stereo_len],
+                            Some(&mut voice[..stereo_len]),
+                            2,
+                            sample_rate,
+                        );
+                    } else {
+                        mixer.render(&mut stereo[..stereo_len], 2, sample_rate);
+                    }
                 }
 
-                if monitor_active.load(Ordering::Relaxed) {
+                // The headphones hear the whole program either way.
+                if monitor_on {
                     lock_monitor(&monitor_ring).push_block(&stereo[..stereo_len], sample_rate);
                 }
 
-                for (out_frame, source) in data
-                    .chunks_mut(channels)
-                    .zip(stereo[..stereo_len].chunks_exact(2))
-                {
+                let program = if headphones_only {
+                    &voice[..stereo_len]
+                } else {
+                    &stereo[..stereo_len]
+                };
+
+                for (out_frame, source) in data.chunks_mut(channels).zip(program.chunks_exact(2)) {
                     let left = source[0].clamp(-1.0, 1.0);
                     let right = source[1].clamp(-1.0, 1.0);
                     if channels == 1 {
@@ -1230,6 +1334,103 @@ mod tests {
         let mut rest = vec![0.0f32; 4800 * 2];
         mixer.render(&mut rest, 2, 48_000);
         assert!(mixer.snapshot().current.is_none());
+    }
+
+    #[test]
+    fn headphones_only_keeps_sounds_out_of_the_microphone_bus() {
+        let mut mixer = Mixer::default();
+        mixer.set_output_format(48_000, 2);
+        mixer.mic_monitor = true;
+        mixer.mic_gain = 0.5;
+        mixer.mic.input_rate = 48_000;
+        // Prebuffer a constant voice so the voice bus has something to send.
+        mixer.push_mic(&vec![0.8f32; 4800], 1);
+
+        // A clip alternating every frame shows what leaked into which bus.
+        let alternating = DecodedSound {
+            samples: Arc::from(
+                (0..4800)
+                    .flat_map(|index| {
+                        let value = if index % 2 == 0 { 0.4f32 } else { -0.4f32 };
+                        [value, value]
+                    })
+                    .collect::<Vec<f32>>()
+                    .into_boxed_slice(),
+            ),
+            sample_rate: 48_000,
+            duration: 0.1,
+            waveform: Arc::from(vec![1.0f32; WAVEFORM_BUCKETS].into_boxed_slice()),
+        };
+        mixer.trigger(3, Arc::new(alternating), 1.0, 0.0);
+
+        let mut program = vec![0.0f32; 512 * 2];
+        let mut voice = vec![0.0f32; 512 * 2];
+        mixer.render_with_voice_bus(&mut program, Some(&mut voice), 2, 48_000);
+
+        // The headphones get the clip: the program alternates loudly.
+        let loudest = program.iter().copied().fold(f32::MIN, f32::max);
+        let quietest = program.iter().copied().fold(f32::MAX, f32::min);
+        assert!(loudest - quietest > 0.3);
+
+        // The microphone gets the voice only: constant, not a trace of the clip.
+        let voice_level = voice[0];
+        assert!(voice_level > 0.1);
+        assert!(
+            voice
+                .iter()
+                .all(|sample| (sample - voice_level).abs() < 1e-6)
+        );
+
+        // Without the voice mix the microphone falls silent while the
+        // headphones keep playing.
+        mixer.mic_monitor = false;
+        program.fill(0.0);
+        voice.fill(0.0);
+        mixer.render_with_voice_bus(&mut program, Some(&mut voice), 2, 48_000);
+        assert!(voice.iter().all(|sample| *sample == 0.0));
+        assert!(program.iter().any(|sample| sample.abs() > 0.1));
+    }
+
+    #[test]
+    fn polyphonic_mixers_keep_the_previous_voice() {
+        let mut mixer = Mixer::default();
+        mixer.trigger(1, Arc::new(test_tone(4800)), 1.0, 0.0);
+        mixer.trigger(2, Arc::new(test_tone(4800)), 1.0, 0.0);
+        assert_eq!(mixer.voices.len(), 1, "exclusive by default");
+
+        mixer.polyphonic = true;
+        mixer.trigger(1, Arc::new(test_tone(4800)), 1.0, 0.0);
+        mixer.trigger(2, Arc::new(test_tone(4800)), 1.0, 0.0);
+        assert_eq!(mixer.voices.len(), 2, "pads stack");
+        assert_eq!(mixer.snapshot().playing.len(), 2);
+
+        // Triggering the same pad again restarts its voice instead of doubling it.
+        mixer.trigger(2, Arc::new(test_tone(4800)), 1.0, 0.0);
+        assert_eq!(mixer.voices.len(), 2);
+        assert_eq!(mixer.snapshot().current.unwrap().sound_id, 2);
+    }
+
+    #[test]
+    fn the_transport_promotes_the_next_voice_when_one_ends() {
+        let mut mixer = Mixer {
+            polyphonic: true,
+            ..Mixer::default()
+        };
+        mixer.trigger(1, Arc::new(test_tone(48_000)), 1.0, 0.0);
+        mixer.trigger(2, Arc::new(test_tone(2_400)), 1.0, 0.0);
+        assert_eq!(mixer.snapshot().current.unwrap().sound_id, 2);
+
+        let mut buffer = vec![0.0f32; 4800 * 2];
+        mixer.render(&mut buffer, 2, 48_000);
+        let snapshot = mixer.snapshot();
+        assert_eq!(
+            snapshot
+                .current
+                .expect("the long clip is still on air")
+                .sound_id,
+            1
+        );
+        assert_eq!(snapshot.playing, vec![1]);
     }
 
     #[test]

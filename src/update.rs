@@ -9,6 +9,8 @@ use ureq::Agent;
 const REPO: &str = "xBounceIT/SimpleSoundboard";
 /// Version compiled into this build, kept in step with Cargo.toml and the tag.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The same version as it is shown to people, with the release tag prefix.
+pub const CURRENT_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const USER_AGENT: &str = concat!("SimpleSoundboard/", env!("CARGO_PKG_VERSION"));
 /// Largest setup accepted from GitHub, to reject an HTML error page early.
 const MAX_SETUP_BYTES: u64 = 512 * 1024 * 1024;
@@ -22,10 +24,59 @@ pub struct AvailableUpdate {
     pub setup_name: String,
 }
 
+/// The Windows setup attached to a release.
+#[derive(Clone, Debug)]
+pub struct SetupAsset {
+    pub name: String,
+    pub url: String,
+}
+
+/// A published release, as the settings page shows it.
+#[derive(Clone, Debug)]
+pub struct Release {
+    /// Version without the `v` prefix.
+    pub version: String,
+    /// Release title, for example "SimpleSoundboard 1.1.0".
+    pub title: String,
+    /// Release notes in markdown, as written on GitHub.
+    pub notes: String,
+    pub release_url: String,
+    /// ISO-8601 timestamp from GitHub, if it was published.
+    pub published_at: Option<String>,
+    pub setup: Option<SetupAsset>,
+}
+
+impl Release {
+    /// Whether this release is newer than the build in use.
+    pub fn is_newer(&self) -> bool {
+        is_newer(&self.version, CURRENT_VERSION)
+    }
+
+    /// The update to install, when this release is newer and ships a setup.
+    pub fn update(&self) -> Option<AvailableUpdate> {
+        if !self.is_newer() {
+            return None;
+        }
+        let setup = self.setup.as_ref()?;
+        Some(AvailableUpdate {
+            version: self.version.clone(),
+            release_url: self.release_url.clone(),
+            setup_url: setup.url.clone(),
+            setup_name: setup.name.clone(),
+        })
+    }
+}
+
 #[derive(Deserialize)]
 struct GithubRelease {
     tag_name: String,
     html_url: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    published_at: Option<String>,
     #[serde(default)]
     assets: Vec<GithubAsset>,
 }
@@ -53,12 +104,12 @@ fn http_agent(timeout_secs: u64) -> Agent {
         .into()
 }
 
-/// Ask GitHub for the latest published release.
+/// Ask GitHub for the latest published release, regardless of its version.
 ///
 /// A missing release (404) simply means there is nothing to offer yet; network
 /// and API failures are returned so the caller can log them without bothering
 /// the user with a startup error.
-pub fn check() -> Result<Option<AvailableUpdate>, String> {
+pub fn fetch_latest() -> Result<Option<Release>, String> {
     let agent = http_agent(10);
     let mut response = match agent.get(&latest_release_url()).call() {
         Ok(response) => response,
@@ -75,27 +126,40 @@ pub fn check() -> Result<Option<AvailableUpdate>, String> {
         serde_json::from_str(&body).map_err(|error| format!("Invalid GitHub response: {error}"))?;
 
     let version = release.tag_name.trim_start_matches(['v', 'V']).to_string();
-    if !is_newer(&version, CURRENT_VERSION) {
-        return Ok(None);
-    }
-
-    let asset = release
+    let setup = release
         .assets
         .iter()
         .find(|asset| is_setup_asset(&asset.name))
-        .ok_or_else(|| format!("Release v{version} has no Windows setup"))?;
-    let setup_name = Path::new(&asset.name)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "Invalid setup name".to_string())?
-        .to_string();
+        .and_then(|asset| {
+            let name = Path::new(&asset.name)
+                .file_name()
+                .and_then(|name| name.to_str())?
+                .to_string();
+            Some(SetupAsset {
+                name,
+                url: asset.browser_download_url.clone(),
+            })
+        });
+    let title = if release.name.trim().is_empty() {
+        format!("SimpleSoundboard v{version}")
+    } else {
+        release.name.trim().to_string()
+    };
 
-    Ok(Some(AvailableUpdate {
+    Ok(Some(Release {
         version,
+        title,
+        notes: release.body,
         release_url: release.html_url,
-        setup_url: asset.browser_download_url.clone(),
-        setup_name,
+        published_at: release.published_at,
+        setup,
     }))
+}
+
+/// Ask GitHub for the latest release and keep it only when it is worth showing
+/// as an update.
+pub fn check() -> Result<Option<AvailableUpdate>, String> {
+    Ok(fetch_latest()?.and_then(|release| release.update()))
 }
 
 /// Download the setup next to the other temporary files and make sure it is a
@@ -204,8 +268,45 @@ fn is_setup_asset(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_newer, is_setup_asset, is_windows_executable, parse_version};
+    use super::{
+        CURRENT_VERSION, Release, SetupAsset, is_newer, is_setup_asset, is_windows_executable,
+        parse_version,
+    };
     use std::fs;
+
+    #[test]
+    fn only_newer_releases_with_a_setup_are_offered() {
+        let setup = Some(SetupAsset {
+            name: "SimpleSoundboard-Setup-9.9.9.exe".to_string(),
+            url: "https://example.test/setup.exe".to_string(),
+        });
+        let newer = Release {
+            version: "9.9.9".to_string(),
+            title: "SimpleSoundboard 9.9.9".to_string(),
+            notes: "- Something new".to_string(),
+            release_url: "https://example.test/release".to_string(),
+            published_at: None,
+            setup: setup.clone(),
+        };
+        assert!(newer.is_newer());
+        assert_eq!(
+            newer.update().expect("offered").setup_name,
+            "SimpleSoundboard-Setup-9.9.9.exe"
+        );
+
+        let installed = Release {
+            version: CURRENT_VERSION.to_string(),
+            ..newer.clone()
+        };
+        assert!(!installed.is_newer());
+        assert!(installed.update().is_none());
+
+        let no_setup = Release {
+            setup: None,
+            ..newer.clone()
+        };
+        assert!(no_setup.update().is_none());
+    }
 
     #[test]
     fn versions_compare_numerically_and_strip_the_tag_prefix() {

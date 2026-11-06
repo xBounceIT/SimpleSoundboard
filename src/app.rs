@@ -47,6 +47,13 @@ pub(crate) const PAGE_SIZE_OPTIONS: [usize; 7] = [3, 6, 9, 12, 18, 24, 48];
 /// Ceiling for [`PageSize::Auto`] on very tall windows.
 const MAX_AUTO_PAGE_SIZE: usize = 60;
 
+/// Narrowest a pad may get, in rem. Wider windows add columns instead of
+/// stretching the same three pads across the whole library.
+const MIN_TILE_WIDTH_REM: f32 = 16.0;
+
+/// Ceiling on the Auto column count, so 4K windows still get readable pads.
+const MAX_AUTO_COLUMNS: usize = 10;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PersistedState {
     #[serde(default)]
@@ -74,6 +81,12 @@ struct PersistedState {
     /// Sounds per page; `None` is the Auto behaviour.
     #[serde(default)]
     per_page: Option<usize>,
+    /// Sounds play on the headphones only and never reach the microphone.
+    #[serde(default)]
+    headphones_only: Option<bool>,
+    /// Let pads play on top of each other instead of interrupting.
+    #[serde(default)]
+    polyphonic: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -176,44 +189,71 @@ fn page_size_labels() -> Vec<SharedString> {
         .collect()
 }
 
-/// Sounds per page that fit the current window when [`PageSize::Auto`] is
-/// selected.
-fn auto_page_size(window: &Window) -> usize {
-    auto_page_size_for(
-        f32::from(window.viewport_size().width),
-        f32::from(window.viewport_size().height),
-        f32::from(window.rem_size()),
-    )
+/// Pad geometry for the current window, shared by the page-size calculation
+/// and by the grid that renders the pads, so the two can never disagree.
+pub(crate) struct LibraryMetrics {
+    /// Pads per row. The grid only needs [`tile_width`](Self::tile_width), so
+    /// this is read by the layout tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    columns: usize,
+    /// Width of a single pad, in pixels.
+    pub(crate) tile_width: f32,
+    /// Sounds that fill the window with whole rows.
+    per_page: usize,
 }
 
-/// The page size that fills the library with whole rows of pads.
-///
-/// The measurements mirror the rem-based layout in `view.rs`:
-///
-/// * a 4rem title bar (`h_16`) and a 6rem transport bar (`h_24`) sit above and
-///   below the library;
-/// * the library toolbar adds 3.75rem (`pt_5` + the 2rem search field + `pb_2`)
-///   and the pagination footer 3rem (`py_3` around small controls);
-/// * pads are 12rem tall (`h_48`) and 32% wide, with a 0.75rem gap (`gap_3`)
-///   and 2rem of vertical padding inside the grid (`pt_3` + `pb_5`).
-///
-/// The trim editor temporarily shrinks the listing, but Auto deliberately
-/// follows only the window so the page size stays put while trimming.
-///
-/// Keep those values in sync if the layout around the library changes.
-fn auto_page_size_for(width: f32, height: f32, rem: f32) -> usize {
-    let rem = rem.max(1.0);
-    let library_width = (width - 20.0 * rem).max(1.0); // routing panel `w_80`
-    let content_width = (library_width - 2.5 * rem).max(1.0); // grid `px_5`
-    let gap = 0.75 * rem;
-    let tile_width = 0.32 * content_width;
-    let columns = (((content_width + gap) / (tile_width + gap)).floor() as usize).max(1);
+impl LibraryMetrics {
+    /// Measure the library of an actual window.
+    pub(crate) fn for_window(window: &Window) -> Self {
+        Self::for_viewport(
+            f32::from(window.viewport_size().width),
+            f32::from(window.viewport_size().height),
+            f32::from(window.rem_size()),
+        )
+    }
 
-    let grid_height = (height - 16.75 * rem).max(0.0);
-    let content_height = (grid_height - 2.0 * rem).max(0.0);
-    let rows = (((content_height + gap) / (12.0 * rem + gap)).floor() as usize).max(1);
+    /// The geometry that fills the library with whole rows of pads.
+    ///
+    /// The measurements mirror the rem-based layout in `view.rs`:
+    ///
+    /// * a 4rem title bar (`h_16`) and a 6rem transport bar (`h_24`) sit above
+    ///   and below the library;
+    /// * the library toolbar adds 3.75rem (`pt_5` + the 2rem search field +
+    ///   `pb_2`) and the pagination footer 3rem (`py_3` around small controls);
+    /// * pads are 12rem tall (`h_48`), at least [`MIN_TILE_WIDTH_REM`] wide,
+    ///   separated by a 0.75rem gap (`gap_3`), inside 2rem of vertical padding
+    ///   (`pt_3` + `pb_5`) and 2.5rem of horizontal padding (`px_5`).
+    ///
+    /// Columns are derived from a *minimum* pad width, so a wider window gains
+    /// columns (and pads) instead of just widening the ones it already shows.
+    ///
+    /// The trim editor temporarily shrinks the listing, but Auto deliberately
+    /// follows only the window so the page size stays put while trimming.
+    ///
+    /// Keep those values in sync if the layout around the library changes.
+    fn for_viewport(width: f32, height: f32, rem: f32) -> Self {
+        let rem = rem.max(1.0);
+        let library_width = (width - 20.0 * rem).max(1.0); // routing panel `w_80`
+        let content_width = (library_width - 2.5 * rem).max(1.0); // grid `px_5`
+        let gap = 0.75 * rem;
+        let min_tile_width = MIN_TILE_WIDTH_REM * rem;
+        let columns = (((content_width + gap) / (min_tile_width + gap)).floor() as usize)
+            .clamp(1, MAX_AUTO_COLUMNS);
+        // Leave a little slack on the right of every row so fractional pixel
+        // widths can never overflow and wrap a pad onto the next row.
+        let usable_width = content_width * 0.99;
+        let tile_width = ((usable_width - gap * (columns - 1) as f32) / columns as f32).max(1.0);
 
-    (columns * rows).clamp(1, MAX_AUTO_PAGE_SIZE)
+        let grid_height = (height - 16.75 * rem).max(0.0);
+        let content_height = (grid_height - 2.0 * rem).max(0.0);
+        let rows = (((content_height + gap) / (12.0 * rem + gap)).floor() as usize).max(1);
+
+        Self {
+            columns,
+            tile_width,
+            per_page: (columns * rows).clamp(1, MAX_AUTO_PAGE_SIZE),
+        }
+    }
 }
 
 /// Position of a pointer inside a pad waveform, as a fraction of the clip.
@@ -275,6 +315,10 @@ pub struct SoundboardApp {
     mic_monitor: bool,
     mic_gain: f32,
     looping: bool,
+    /// Sounds are routed to the headphones instead of the virtual microphone.
+    headphones_only: bool,
+    /// Pads stack instead of interrupting the previous one.
+    polyphonic: bool,
 
     paused: bool,
     transport: Option<TransportSnapshot>,
@@ -287,6 +331,8 @@ pub struct SoundboardApp {
     output_level_l: f32,
     output_level_r: f32,
     mic_level: f32,
+    /// Sounds with a voice on air, from the last telemetry tick.
+    live_sounds: Vec<SoundId>,
 
     output_devices: Vec<DeviceChoice>,
     input_devices: Vec<DeviceChoice>,
@@ -323,6 +369,12 @@ pub struct SoundboardApp {
     update_downloading: bool,
     update_error: Option<SharedString>,
     update_dismissed: bool,
+
+    /// The settings page and the release it is showing.
+    settings_open: bool,
+    latest_release: Option<update::Release>,
+    checking_updates: bool,
+    update_check_error: Option<SharedString>,
 
     audio: AudioEngine,
     focus_handle: FocusHandle,
@@ -423,6 +475,14 @@ impl SoundboardApp {
         if let Some(name) = monitor_preference {
             monitor_device = audio.set_monitor_device(&name).ok();
         }
+
+        // Routing the bank into the headphones needs headphones to route into.
+        let headphones_only =
+            persisted.headphones_only.unwrap_or(false) && monitor_device.is_some();
+        audio.set_headphones_only(headphones_only);
+
+        let polyphonic = persisted.polyphonic.unwrap_or(false);
+        audio.set_polyphonic(polyphonic);
 
         let output_labels = device_labels(&output_devices);
         let output_index = output_device
@@ -529,7 +589,7 @@ impl SoundboardApp {
             )
         });
         let initial_per_page = match page_size {
-            PageSize::Auto => auto_page_size(window),
+            PageSize::Auto => LibraryMetrics::for_window(window).per_page,
             PageSize::Fixed(size) => size,
         };
         let initial_page = selected_id
@@ -549,6 +609,8 @@ impl SoundboardApp {
             mic_monitor: mic_monitor && input_device.is_some(),
             mic_gain,
             looping,
+            headphones_only,
+            polyphonic,
             paused: false,
             transport: None,
             playback_elapsed: 0.0,
@@ -559,6 +621,7 @@ impl SoundboardApp {
             output_level_l: 0.0,
             output_level_r: 0.0,
             mic_level: 0.0,
+            live_sounds: Vec::new(),
             output_devices,
             input_devices,
             monitor_devices,
@@ -591,6 +654,10 @@ impl SoundboardApp {
             update_downloading: false,
             update_error: None,
             update_dismissed: false,
+            settings_open: false,
+            latest_release: None,
+            checking_updates: false,
+            update_check_error: None,
             audio,
             focus_handle,
             _subscriptions: Vec::new(),
@@ -1159,7 +1226,7 @@ impl SoundboardApp {
     }
 
     fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
-        if self.shortcut_target.is_some() {
+        if self.settings_open || self.shortcut_target.is_some() {
             return;
         }
         self.search_input.update(cx, |input, cx| {
@@ -1198,6 +1265,13 @@ impl SoundboardApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The settings page is a separate screen: the escape action leaves it
+        // (see on_stop_action) and pad shortcuts stay quiet while it is open.
+        if self.settings_open {
+            cx.stop_propagation();
+            return;
+        }
+
         if let Some(id) = self.shortcut_target {
             if event.keystroke.key.eq_ignore_ascii_case("escape") {
                 self.cancel_shortcut_capture(cx);
@@ -1289,7 +1363,7 @@ impl SoundboardApp {
     /// Sounds shown on one page: the selected fixed size or the window fit.
     fn per_page(&self, window: &Window) -> usize {
         match self.page_size {
-            PageSize::Auto => auto_page_size(window),
+            PageSize::Auto => LibraryMetrics::for_window(window).per_page,
             PageSize::Fixed(size) => size,
         }
     }
@@ -1369,6 +1443,7 @@ impl SoundboardApp {
                 Err(error) => {
                     self.audio.clear_monitor_device();
                     self.monitor_device = None;
+                    self.drop_headphones_only();
                     self.restore_monitor_selection(window, cx);
                     self.save_state();
                     window.push_notification(
@@ -1381,6 +1456,7 @@ impl SoundboardApp {
         } else {
             self.audio.clear_monitor_device();
             self.monitor_device = None;
+            self.drop_headphones_only();
             self.save_state();
             window.push_notification("Headphone monitor off.", cx);
             cx.notify();
@@ -1403,6 +1479,7 @@ impl SoundboardApp {
         }) {
             self.audio.clear_monitor_device();
             self.monitor_device = None;
+            self.drop_headphones_only();
         }
 
         let labels = monitor_device_labels(&self.monitor_devices);
@@ -1458,6 +1535,31 @@ impl SoundboardApp {
         self.mic_level = snapshot.mic_level;
         self.transport = snapshot.current.clone();
         self.paused = snapshot.paused;
+        self.live_sounds = snapshot.playing;
+
+        let mut changed = false;
+
+        let previous_id = old_current.as_ref().map(|current| current.sound_id);
+        let next_id = self.transport.as_ref().map(|current| current.sound_id);
+        if previous_id != next_id {
+            changed = true;
+            // A promoted voice starts its own clock: in polyphonic mode the
+            // transport moves to another pad when the current one ends.
+            self.playback_elapsed = 0.0;
+            self.seek_dragging = false;
+            self.seek_preview = 0.0;
+            if next_id.is_none() {
+                self.trim_preview_active = false;
+                let seek = self.seek_slider.clone();
+                seek.update(cx, |slider, cx| slider.set_value(0.0, window, cx));
+            } else if let Some(id) = next_id {
+                // With pads stacking the bar follows the pad that is still on
+                // air, unless the user is busy renaming or trimming.
+                if self.rename_target.is_none() && self.trim_target.is_none() {
+                    self.selected_id = Some(id);
+                }
+            }
+        }
 
         let loop_allowed = self.looping && !self.trim_preview_active;
         if self.transport.is_some() && !self.paused && !loop_allowed {
@@ -1471,7 +1573,9 @@ impl SoundboardApp {
                 && (current.position + 0.0005 >= current.duration
                     || playback_watchdog_expired(self.playback_elapsed, current.duration))
         });
-        if reached_end && !self.paused && !loop_allowed {
+        // With pads stacking, other voices stay on air when one ends: the
+        // mixer promotes the next voice and the transport follows it.
+        if reached_end && !self.paused && !loop_allowed && !self.polyphonic {
             self.audio.stop_all();
             self.transport = None;
             self.paused = false;
@@ -1479,7 +1583,6 @@ impl SoundboardApp {
             self.playback_elapsed = 0.0;
         }
 
-        let mut changed = false;
         if (self.output_level_l - old_l).abs() > 0.001
             || (self.output_level_r - old_r).abs() > 0.001
             || (self.mic_level - old_mic).abs() > 0.001
@@ -1488,20 +1591,6 @@ impl SoundboardApp {
         }
         if old_paused != self.paused {
             changed = true;
-        }
-
-        let previous_id = old_current.as_ref().map(|current| current.sound_id);
-        let next_id = self.transport.as_ref().map(|current| current.sound_id);
-        if previous_id != next_id {
-            changed = true;
-            if next_id.is_none() && previous_id.is_some() {
-                self.seek_dragging = false;
-                self.seek_preview = 0.0;
-                self.trim_preview_active = false;
-                self.playback_elapsed = 0.0;
-                let seek = self.seek_slider.clone();
-                seek.update(cx, |slider, cx| slider.set_value(0.0, window, cx));
-            }
         }
 
         if let Some(current) = &self.transport {
@@ -1546,10 +1635,7 @@ impl SoundboardApp {
     }
 
     fn is_sound_playing(&self, id: SoundId) -> bool {
-        self.transport
-            .as_ref()
-            .is_some_and(|current| current.sound_id == id)
-            && !self.paused
+        !self.paused && self.live_sounds.contains(&id)
     }
 
     fn output_is_virtual(&self) -> bool {
@@ -1572,6 +1658,7 @@ impl SoundboardApp {
                 if self.monitor_device.as_deref() == Some(name.as_str()) {
                     self.audio.clear_monitor_device();
                     self.monitor_device = None;
+                    self.drop_headphones_only();
                 }
                 self.output_device = Some(name);
                 self.sync_monitor_devices(window, cx);
@@ -1795,6 +1882,15 @@ impl SoundboardApp {
         .detach();
     }
 
+    /// Let pads play on top of each other: a trigger no longer releases the
+    /// previous clip.
+    fn toggle_polyphonic(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.polyphonic = enabled;
+        self.audio.set_polyphonic(enabled);
+        self.save_state();
+        cx.notify();
+    }
+
     fn activate_sound(&mut self, id: SoundId, window: &mut Window, cx: &mut Context<Self>) {
         let is_current = self
             .transport
@@ -1806,6 +1902,9 @@ impl SoundboardApp {
                 self.audio.set_paused(false);
                 self.last_telemetry = Instant::now();
                 cx.notify();
+            } else if self.polyphonic {
+                // Other pads may still be on air: stop this one only.
+                self.audio.stop_sound(id);
             } else {
                 self.stop_playback(window, cx);
             }
@@ -1910,8 +2009,74 @@ impl SoundboardApp {
         cx.notify();
     }
 
-    fn open_update_notes(&mut self, cx: &mut Context<Self>) {
-        if let Some(available) = &self.available_update {
+    fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_open {
+            self.close_settings(cx);
+        } else {
+            self.open_settings(window, cx);
+        }
+    }
+
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = true;
+        cx.notify();
+        if self.latest_release.is_none() {
+            self.check_updates(window, cx);
+        }
+    }
+
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        cx.notify();
+    }
+
+    /// Fetch the latest release for the settings page. The running build keeps
+    /// playing: only the update cards change.
+    fn check_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.checking_updates {
+            return;
+        }
+        self.checking_updates = true;
+        self.update_check_error = None;
+        self.update_error = None;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, window| {
+            let result = window
+                .background_spawn(async { update::fetch_latest() })
+                .await;
+            let _ = this.update_in(window, |this, _, cx| {
+                this.checking_updates = false;
+                match result {
+                    Ok(Some(release)) => {
+                        this.available_update = release.update();
+                        this.latest_release = Some(release);
+                    }
+                    Ok(None) => {
+                        this.available_update = None;
+                        this.latest_release = None;
+                    }
+                    Err(error) => this.update_check_error = Some(error.into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The toast's "See changes" lands in the settings page, where the notes
+    /// are rendered, instead of throwing the user at a browser tab.
+    fn show_release_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_dismissed = true;
+        self.open_settings(window, cx);
+    }
+
+    /// Open the release the settings page is showing, falling back to the
+    /// update offered by the startup check.
+    fn open_release_page(&mut self, cx: &mut Context<Self>) {
+        if let Some(release) = &self.latest_release {
+            cx.open_url(&release.release_url);
+        } else if let Some(available) = &self.available_update {
             cx.open_url(&available.release_url);
         }
     }
@@ -1978,6 +2143,36 @@ impl SoundboardApp {
         self.audio.set_mic_monitor(enabled);
         self.save_state();
         cx.notify();
+    }
+
+    /// Keep the sounds on the headphones and the microphone on the voice.
+    fn toggle_headphones_only(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if enabled && self.monitor_device.is_none() {
+            window.push_notification(
+                "Pick a headphone monitor before routing the bank to the headphones.",
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        self.headphones_only = enabled;
+        self.audio.set_headphones_only(enabled);
+        self.save_state();
+        cx.notify();
+    }
+
+    /// The headphone route dies with the headphones: drop it when the monitor
+    /// device goes away so sounds never end up muted by accident.
+    fn drop_headphones_only(&mut self) {
+        if self.headphones_only {
+            self.headphones_only = false;
+            self.audio.set_headphones_only(false);
+        }
     }
 
     fn refresh_devices(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2269,6 +2464,8 @@ impl SoundboardApp {
             monitor_device: self.monitor_device.clone(),
             monitor_enabled: Some(self.monitor_device.is_some()),
             per_page: self.page_size.saved(),
+            headphones_only: Some(self.headphones_only),
+            polyphonic: Some(self.polyphonic),
         };
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -2337,13 +2534,17 @@ impl SoundboardApp {
     }
 
     fn on_play_pause_action(&mut self, _: &PlayPause, window: &mut Window, cx: &mut Context<Self>) {
-        if self.shortcut_target.is_some() {
+        if self.settings_open || self.shortcut_target.is_some() {
             return;
         }
         self.toggle_playback(window, cx);
     }
 
     fn on_stop_action(&mut self, _: &StopPlayback, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_open {
+            self.close_settings(cx);
+            return;
+        }
         if self.shortcut_target.is_some() {
             self.cancel_shortcut_capture(cx);
             return;
@@ -2360,7 +2561,7 @@ impl SoundboardApp {
     }
 
     fn on_next_action(&mut self, _: &NextSound, window: &mut Window, cx: &mut Context<Self>) {
-        if self.shortcut_target.is_some() {
+        if self.settings_open || self.shortcut_target.is_some() {
             return;
         }
         self.skip(1, window, cx);
@@ -2372,21 +2573,21 @@ impl SoundboardApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.shortcut_target.is_some() {
+        if self.settings_open || self.shortcut_target.is_some() {
             return;
         }
         self.previous(window, cx);
     }
 
     fn on_add_action(&mut self, _: &AddSounds, window: &mut Window, cx: &mut Context<Self>) {
-        if self.shortcut_target.is_some() {
+        if self.settings_open || self.shortcut_target.is_some() {
             return;
         }
         self.open_file_dialog(window, cx);
     }
 
     fn on_loop_action(&mut self, _: &ToggleLoop, _: &mut Window, cx: &mut Context<Self>) {
-        if self.shortcut_target.is_some() {
+        if self.settings_open || self.shortcut_target.is_some() {
             return;
         }
         self.toggle_loop(cx);
@@ -2499,13 +2700,17 @@ fn load_state() -> PersistedState {
 #[cfg(test)]
 mod tests {
     use super::{
-        PageSize, auto_monitor_device, auto_page_size_for, build_monitor_devices,
+        LibraryMetrics, PageSize, auto_monitor_device, build_monitor_devices,
         playback_watchdog_expired, state_path, waveform_bar_filled, waveform_ratio,
         waveform_seek_ratio,
     };
     use crate::audio::DeviceChoice;
     use gpui_kit::{Bounds, point, px, size};
     use std::path::Path;
+
+    fn auto_page_size_for(width: f32, height: f32, rem: f32) -> usize {
+        LibraryMetrics::for_viewport(width, height, rem).per_page
+    }
 
     #[test]
     fn waveform_clicks_map_to_positions_inside_the_clip() {
@@ -2580,6 +2785,26 @@ mod tests {
     }
 
     #[test]
+    fn release_notes_split_headings_bullets_and_text() {
+        use super::view::{ReleaseNote, release_note_lines};
+
+        let notes = release_note_lines(
+            "## Fixes\n- **Audio**: the pop is gone\n- Headphones only added\nPlain line\n\n---\n",
+        );
+        assert_eq!(
+            notes,
+            vec![
+                ReleaseNote::Heading("Fixes".into()),
+                ReleaseNote::Bullet("Audio: the pop is gone".into()),
+                ReleaseNote::Bullet("Headphones only added".into()),
+                ReleaseNote::Text("Plain line".into()),
+            ]
+        );
+        assert!(release_note_lines("").is_empty());
+        assert!(release_note_lines("---\n\n***").is_empty());
+    }
+
+    #[test]
     fn auto_page_size_fills_the_library_with_whole_rows() {
         // Default 1280×860 window: three rows of three pads fit.
         assert_eq!(auto_page_size_for(1280.0, 860.0, 15.0), 9);
@@ -2587,8 +2812,34 @@ mod tests {
         assert_eq!(auto_page_size_for(1120.0, 760.0, 15.0), 6);
         // A taller window gains a row.
         assert_eq!(auto_page_size_for(1280.0, 1080.0, 15.0), 12);
-        // Smaller windows never go below a single row.
-        assert_eq!(auto_page_size_for(400.0, 300.0, 15.0), 2);
+        // A wider window gains columns instead of stretching the pads.
+        assert_eq!(auto_page_size_for(1920.0, 860.0, 15.0), 18);
+        assert_eq!(auto_page_size_for(2560.0, 1392.0, 15.0), 40);
+        // Smaller windows never go below a single pad.
+        assert_eq!(auto_page_size_for(400.0, 300.0, 15.0), 1);
+    }
+
+    #[test]
+    fn library_pads_never_overflow_their_row() {
+        for (width, height) in [
+            (1120.0, 760.0),
+            (1280.0, 860.0),
+            (1600.0, 1000.0),
+            (1920.0, 1080.0),
+            (2560.0, 1392.0),
+            (3840.0, 2160.0),
+        ] {
+            let metrics = LibraryMetrics::for_viewport(width, height, 15.0);
+            let rem = 15.0;
+            let content_width = width - 20.0 * rem - 2.5 * rem;
+            let row_width = metrics.columns as f32 * metrics.tile_width
+                + (metrics.columns - 1) as f32 * 0.75 * rem;
+            assert!(
+                row_width <= content_width,
+                "{width}×{height}: {row_width} > {content_width}"
+            );
+            assert!(metrics.tile_width >= 15.5 * rem);
+        }
     }
 
     #[test]
