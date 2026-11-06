@@ -2331,15 +2331,6 @@ impl SoundboardApp {
             .w(px(232.0))
             .flex_shrink_0()
             .gap_1()
-            .child(
-                div()
-                    .px_3()
-                    .pb_1()
-                    .font_family(MONO_FONT)
-                    .text_xs()
-                    .text_color(p.ink_muted)
-                    .child("CATEGORIES"),
-            )
             .children(rows)
             .into_any_element()
     }
