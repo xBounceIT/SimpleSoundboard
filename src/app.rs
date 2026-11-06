@@ -124,6 +124,26 @@ struct WaveformHover {
     ratio: f32,
 }
 
+/// Categories of the settings page, shown one per row on the left.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SettingsSection {
+    #[default]
+    Preferences,
+    /// Version, updates, release notes and where the bank is saved.
+    About,
+}
+
+impl SettingsSection {
+    pub(crate) const ALL: [Self; 2] = [Self::Preferences, Self::About];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Preferences => "PREFERENCES",
+            Self::About => "ABOUT",
+        }
+    }
+}
+
 /// How many sounds the library shows on one page.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum PageSize {
@@ -372,6 +392,7 @@ pub struct SoundboardApp {
 
     /// The settings page and the release it is showing.
     settings_open: bool,
+    settings_section: SettingsSection,
     latest_release: Option<update::Release>,
     checking_updates: bool,
     update_check_error: Option<SharedString>,
@@ -655,6 +676,7 @@ impl SoundboardApp {
             update_error: None,
             update_dismissed: false,
             settings_open: false,
+            settings_section: SettingsSection::default(),
             latest_release: None,
             checking_updates: false,
             update_check_error: None,
@@ -2030,6 +2052,15 @@ impl SoundboardApp {
         cx.notify();
     }
 
+    /// Show a different category in the settings page.
+    fn choose_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        if self.settings_section == section {
+            return;
+        }
+        self.settings_section = section;
+        cx.notify();
+    }
+
     /// Fetch the latest release for the settings page. The running build keeps
     /// playing: only the update cards change.
     fn check_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2068,6 +2099,7 @@ impl SoundboardApp {
     /// are rendered, instead of throwing the user at a browser tab.
     fn show_release_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.update_dismissed = true;
+        self.settings_section = SettingsSection::About;
         self.open_settings(window, cx);
     }
 

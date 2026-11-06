@@ -102,14 +102,12 @@ The app uses these crates:
 
 ## Settings
 
-The gear in the title bar opens a settings page, with **Esc** or **Back to the board** to leave it.
+The gear in the title bar opens a settings page: a category list on the left, the selected category on the right, with **Esc** or **Back to the board** to leave it.
 
-- **UPDATES** shows the installed version next to the latest published one, the state of the check and two actions: **Check for updates** asks GitHub again, **Install update** downloads the setup, verifies it is a Windows executable, runs it silently and closes the app while it replaces the files.
-- **CHANGES** renders the release notes of the latest release — headings, bullet points and the full-changelog link — in a scrollable panel, so the notes are readable without opening a browser. **Open on GitHub** is there when you want the full page.
 - **PREFERENCES** holds the behaviour switches. **Overlapping sounds** lets a new pad start without stopping the one on air: every pad keeps its own voice, the pad that was triggered again restarts, and the transport follows the newest voice — when it ends, the bar moves to whichever pad is still playing. Leaving it off keeps the classic exclusive cue.
-- **ABOUT** lists the version, whether the build is a development or release one, and the `state.json` the bank is saved to.
+- **ABOUT** is the app's identity and update centre: the running version, the latest published release and two actions — **Check for updates** asks GitHub again, **Install update** downloads the setup, verifies it is a Windows executable, runs it silently and closes the app while it replaces the files — followed by the release notes in a scrollable panel (headings, bullet points, full-changelog link, **Open on GitHub** for the full page) and the `state.json` the bank is saved to.
 
-A check failure (no network, GitHub down) is reported in the card instead of interrupting the soundboard: the bank and the transport keep working while the page is open.
+A check failure (no network, GitHub down) is reported inside the category instead of interrupting the soundboard: the bank and the transport keep working while the page is open.
 
 ## Commands
 

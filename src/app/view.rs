@@ -23,7 +23,7 @@ use gpui_kit::{
     quad, relative, rems, size, transparent_black,
 };
 
-use super::{SoundboardApp, TrimDrag};
+use super::{SettingsSection, SoundboardApp, TrimDrag};
 use crate::{
     model::{
         Sound, SoundId, SoundStatus, format_duration, format_percent, format_time_precise,
@@ -2222,6 +2222,210 @@ impl SoundboardApp {
 
     fn render_settings(&mut self, cx: &mut gpui_kit::Context<Self>) -> AnyElement {
         let p = palette();
+
+        let header = h_flex()
+            .justify_between()
+            .items_end()
+            .w_full()
+            .gap_3()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(section_label("SETTINGS", p.ink_muted))
+                    .child(
+                        div()
+                            .font_family(DISPLAY_FONT)
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.cream)
+                            .child("Settings"),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .font_family(MONO_FONT)
+                            .text_xs()
+                            .text_color(p.cream_muted)
+                            .child(update::CURRENT_TAG),
+                    )
+                    .child(
+                        Button::new("close-settings")
+                            .label("Back to the board")
+                            .icon(Icon::new(AppIcon::ArrowLeft))
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
+                    ),
+            );
+
+        let nav = self.render_settings_nav(cx);
+        let body = match self.settings_section {
+            SettingsSection::Preferences => self.render_settings_preferences(cx),
+            SettingsSection::About => self.render_settings_about(cx),
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .bg(p.paper)
+            .px_5()
+            .py_4()
+            .child(header)
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_stretch()
+                    .gap_4()
+                    .child(nav)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .v_flex()
+                            .gap_3()
+                            .rounded(cx.theme().radius_lg)
+                            .border_1()
+                            .border_color(p.line)
+                            .bg(p.paper_hi)
+                            .p_4()
+                            .child(body),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The category list: one row per settings section.
+    fn render_settings_nav(&mut self, cx: &mut gpui_kit::Context<Self>) -> AnyElement {
+        let p = palette();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for section in SettingsSection::ALL {
+            let selected = self.settings_section == section;
+            rows.push(
+                div()
+                    .id(("settings-section", section as usize))
+                    .w_full()
+                    .h_9()
+                    .px_3()
+                    .rounded(cx.theme().radius)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .bg(if selected { p.paper_lo } else { p.paper_hi })
+                    .hover(|this| this.bg(p.paper_lo))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.choose_settings_section(section, cx);
+                    }))
+                    .child(
+                        div()
+                            .font_family(MONO_FONT)
+                            .text_xs()
+                            .text_color(if selected { p.cream } else { p.ink_muted })
+                            .child(section.label()),
+                    )
+                    .child(
+                        Icon::new(AppIcon::ChevronRight)
+                            .size_3()
+                            .text_color(if selected {
+                                p.blue
+                            } else {
+                                p.ink_muted.opacity(0.35)
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        v_flex()
+            .w(px(232.0))
+            .flex_shrink_0()
+            .gap_1()
+            .child(
+                div()
+                    .px_3()
+                    .pb_1()
+                    .font_family(MONO_FONT)
+                    .text_xs()
+                    .text_color(p.ink_muted)
+                    .child("CATEGORIES"),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn render_settings_preferences(&mut self, cx: &mut gpui_kit::Context<Self>) -> AnyElement {
+        let p = palette();
+
+        v_flex()
+            .w_full()
+            .max_w(px(720.0))
+            .gap_5()
+            .child(settings_heading(
+                "Preferences",
+                "How the board behaves while you play.",
+                p.ink_muted,
+                None,
+            ))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .gap_3()
+                    .pt_2()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(p.ink)
+                                    .child("Overlapping sounds"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(MONO_FONT)
+                                    .text_xs()
+                                    .line_height(relative(1.3))
+                                    .text_color(if self.polyphonic {
+                                        p.green
+                                    } else {
+                                        p.ink_muted
+                                    })
+                                    .child(if self.polyphonic {
+                                        "PADS PLAY ON TOP OF EACH OTHER"
+                                    } else {
+                                        "A NEW PAD STOPS THE PREVIOUS ONE"
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div().flex_shrink_0().child(
+                            Switch::new("polyphonic")
+                                .checked(self.polyphonic)
+                                .accessibility_label("Play pads on top of each other")
+                                .on_change(cx.listener(|this, checked, _, cx| {
+                                    this.toggle_polyphonic(*checked, cx);
+                                })),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Version, update check, release notes and where the bank lives, in one
+    /// category: they are all answers to "what am I running?".
+    fn render_settings_about(&mut self, cx: &mut gpui_kit::Context<Self>) -> AnyElement {
+        let p = palette();
         let release = self.latest_release.clone();
         let newer = release.as_ref().is_some_and(|release| release.is_newer());
         let downloading = self.update_downloading;
@@ -2263,17 +2467,6 @@ impl SoundboardApp {
             ("No release found on GitHub yet.".to_string(), p.ink_muted)
         };
 
-        let installed_row = v_flex()
-            .gap_0p5()
-            .child(field_label("INSTALLED", p.ink_muted))
-            .child(
-                div()
-                    .font_family(MONO_FONT)
-                    .text_sm()
-                    .text_color(p.ink)
-                    .child(update::CURRENT_TAG),
-            );
-
         let latest_row = v_flex()
             .gap_0p5()
             .child(field_label("LATEST", p.ink_muted))
@@ -2285,6 +2478,25 @@ impl SoundboardApp {
                     .child(match &release {
                         Some(release) => format!("v{}", release.version),
                         None => "—".to_string(),
+                    }),
+            );
+
+        let build_row = v_flex()
+            .gap_0p5()
+            .child(field_label("BUILD", p.ink_muted))
+            .child(
+                div()
+                    .font_family(MONO_FONT)
+                    .text_sm()
+                    .text_color(if cfg!(debug_assertions) {
+                        p.amber
+                    } else {
+                        p.ink
+                    })
+                    .child(if cfg!(debug_assertions) {
+                        "Development"
+                    } else {
+                        "Release"
                     }),
             );
 
@@ -2312,155 +2524,7 @@ impl SoundboardApp {
             .disabled(!installable)
             .on_click(cx.listener(|this, _, window, cx| this.install_update(window, cx)));
 
-        let preferences_card = settings_card(
-            cx,
-            "PREFERENCES",
-            v_flex()
-                .gap_2()
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .items_center()
-                        .gap_3()
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .gap_0p5()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(p.ink)
-                                        .child("Overlapping sounds"),
-                                )
-                                .child(
-                                    div()
-                                        .font_family(MONO_FONT)
-                                        .text_xs()
-                                        .line_height(relative(1.25))
-                                        .text_color(if self.polyphonic {
-                                            p.green
-                                        } else {
-                                            p.ink_muted
-                                        })
-                                        .child(if self.polyphonic {
-                                            "PADS PLAY ON TOP OF EACH OTHER"
-                                        } else {
-                                            "A NEW PAD STOPS THE PREVIOUS ONE"
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div().flex_shrink_0().child(
-                                Switch::new("polyphonic")
-                                    .checked(self.polyphonic)
-                                    .accessibility_label("Play pads on top of each other")
-                                    .on_change(cx.listener(|this, checked, _, cx| {
-                                        this.toggle_polyphonic(*checked, cx);
-                                    })),
-                            ),
-                        ),
-                )
-                .into_any_element(),
-        );
-
-        let updates_card = settings_card(
-            cx,
-            "UPDATES",
-            v_flex()
-                .gap_3()
-                .child(h_flex().gap_6().child(installed_row).child(latest_row))
-                .child(
-                    div()
-                        .text_sm()
-                        .line_height(relative(1.4))
-                        .text_color(status_color)
-                        .child(status),
-                )
-                .when_some(self.update_error.as_ref(), |this, error| {
-                    this.child(
-                        div()
-                            .rounded(cx.theme().radius)
-                            .border_1()
-                            .border_color(p.signal.opacity(0.4))
-                            .bg(p.signal_soft)
-                            .px_3()
-                            .py_2()
-                            .text_xs()
-                            .line_height(relative(1.4))
-                            .text_color(p.cream)
-                            .child(error.clone()),
-                    )
-                })
-                .child(h_flex().gap_2().child(check_button).child(install_button))
-                .into_any_element(),
-        );
-
-        let profile = super::state_path()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| "Not available".to_string());
-        let about_card = settings_card(
-            cx,
-            "ABOUT",
-            v_flex()
-                .gap_3()
-                .child(
-                    h_flex()
-                        .gap_6()
-                        .child(
-                            v_flex()
-                                .gap_0p5()
-                                .child(field_label("VERSION", p.ink_muted))
-                                .child(
-                                    div()
-                                        .font_family(MONO_FONT)
-                                        .text_sm()
-                                        .text_color(p.ink)
-                                        .child(update::CURRENT_TAG),
-                                ),
-                        )
-                        .child(
-                            v_flex()
-                                .gap_0p5()
-                                .child(field_label("BUILD", p.ink_muted))
-                                .child(
-                                    div()
-                                        .font_family(MONO_FONT)
-                                        .text_sm()
-                                        .text_color(if cfg!(debug_assertions) {
-                                            p.amber
-                                        } else {
-                                            p.ink
-                                        })
-                                        .child(if cfg!(debug_assertions) {
-                                            "Development"
-                                        } else {
-                                            "Release"
-                                        }),
-                                ),
-                        ),
-                )
-                .child(
-                    v_flex()
-                        .gap_0p5()
-                        .child(field_label("SETTINGS FILE", p.ink_muted))
-                        .child(
-                            div()
-                                .font_family(MONO_FONT)
-                                .text_xs()
-                                .line_height(relative(1.35))
-                                .text_color(p.ink_muted)
-                                .child(profile),
-                        ),
-                )
-                .into_any_element(),
-        );
-
-        let changes_title = release
-            .as_ref()
-            .map(|release| release.title.clone())
-            .unwrap_or_else(|| "Release notes".to_string());
-        let changes_meta = match &release {
+        let release_meta = match &release {
             Some(release) => match release
                 .published_at
                 .as_deref()
@@ -2497,108 +2561,109 @@ impl SoundboardApp {
             )
         };
 
-        let changes_card = div()
+        let profile = super::state_path()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Not available".to_string());
+
+        v_flex()
+            .w_full()
             .flex_1()
-            .min_w_0()
             .min_h_0()
-            .v_flex()
-            .gap_3()
-            .rounded(cx.theme().radius_lg)
-            .border_1()
-            .border_color(p.line)
-            .bg(p.paper_hi)
-            .p_3()
+            .gap_4()
+            .child(settings_heading(
+                format!("SimpleSoundboard {}", update::CURRENT_TAG),
+                "Version, updates, release notes and where the bank is saved.",
+                p.ink_muted,
+                None,
+            ))
             .child(
-                h_flex()
-                    .justify_between()
-                    .items_start()
+                v_flex()
                     .gap_3()
+                    .pt_1()
+                    .child(h_flex().gap_8().child(latest_row).child(build_row))
                     .child(
-                        v_flex()
-                            .min_w_0()
-                            .gap_1()
-                            .child(section_label("CHANGES", p.ink_muted))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .font_family(DISPLAY_FONT)
-                                    .text_lg()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(p.ink)
-                                    .child(changes_title),
-                            )
-                            .child(
-                                div()
-                                    .font_family(MONO_FONT)
-                                    .text_xs()
-                                    .text_color(p.ink_muted)
-                                    .child(changes_meta),
-                            ),
+                        div()
+                            .text_sm()
+                            .line_height(relative(1.4))
+                            .text_color(status_color)
+                            .child(status),
                     )
-                    .child(open_on_github),
+                    .when_some(self.update_error.as_ref(), |this, error| {
+                        this.child(
+                            div()
+                                .rounded(cx.theme().radius)
+                                .border_1()
+                                .border_color(p.signal.opacity(0.4))
+                                .bg(p.signal_soft)
+                                .px_3()
+                                .py_2()
+                                .text_xs()
+                                .line_height(relative(1.4))
+                                .text_color(p.cream)
+                                .child(error.clone()),
+                        )
+                    })
+                    .child(h_flex().gap_2().child(check_button).child(install_button)),
             )
             .child(
                 div()
-                    .id("release-notes")
+                    .w_full()
                     .flex_1()
                     .min_h_0()
-                    .w_full()
-                    .overflow_y_scrollbar()
-                    .child(notes),
-            );
-
-        let header = h_flex()
-            .justify_between()
-            .items_end()
-            .w_full()
-            .gap_3()
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(section_label("SETTINGS", p.ink_muted))
+                    .v_flex()
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(p.line)
+                    .pt_4()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_start()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(section_label("RELEASE NOTES", p.ink_muted))
+                                    .child(
+                                        div()
+                                            .font_family(MONO_FONT)
+                                            .text_xs()
+                                            .text_color(p.ink_muted)
+                                            .child(release_meta),
+                                    ),
+                            )
+                            .child(open_on_github),
+                    )
                     .child(
                         div()
-                            .font_family(DISPLAY_FONT)
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(p.cream)
-                            .child("Preferences, updates and release notes"),
+                            .id("release-notes")
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .overflow_y_scrollbar()
+                            .child(notes),
                     ),
             )
             .child(
-                Button::new("close-settings")
-                    .label("Back to the board")
-                    .icon(Icon::new(AppIcon::ArrowLeft))
-                    .small()
-                    .ghost()
-                    .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
-            );
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .bg(p.paper)
-            .px_5()
-            .py_4()
-            .child(header)
-            .child(
                 h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .items_stretch()
-                    .gap_4()
+                    .gap_2()
+                    .items_center()
                     .child(
-                        v_flex()
-                            .w(px(360.0))
+                        div()
                             .flex_shrink_0()
-                            .gap_4()
-                            .child(preferences_card)
-                            .child(updates_card)
-                            .child(about_card),
+                            .child(field_label("SETTINGS FILE", p.ink_muted)),
                     )
-                    .child(changes_card),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(MONO_FONT)
+                            .text_xs()
+                            .text_color(p.ink_muted)
+                            .child(profile),
+                    ),
             )
             .into_any_element()
     }
@@ -3040,24 +3105,46 @@ fn field_label(label: &'static str, color: Hsla) -> impl IntoElement {
         .child(label)
 }
 
-/// A titled, bordered card used by the settings page.
-fn settings_card(
-    cx: &mut gpui_kit::Context<SoundboardApp>,
-    title: &'static str,
-    body: AnyElement,
+/// The title block at the top of a settings category: a heading, a line of
+/// context and an optional action on the right.
+fn settings_heading(
+    title: impl Into<SharedString>,
+    subtitle: impl Into<SharedString>,
+    subtitle_color: Hsla,
+    action: Option<AnyElement>,
 ) -> AnyElement {
     let p = palette();
-    div()
+    h_flex()
+        .justify_between()
+        .items_start()
+        .gap_3()
         .w_full()
-        .v_flex()
-        .gap_2()
-        .rounded(cx.theme().radius_lg)
-        .border_1()
-        .border_color(p.line)
-        .bg(p.paper_hi)
-        .p_3()
-        .child(section_label(title, p.ink_muted))
-        .child(body)
+        .child(
+            v_flex()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .truncate()
+                        .font_family(DISPLAY_FONT)
+                        .text_lg()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(p.ink)
+                        .child(title.into()),
+                )
+                .child(
+                    div()
+                        .font_family(MONO_FONT)
+                        .text_xs()
+                        .line_height(relative(1.3))
+                        .text_color(subtitle_color)
+                        .child(subtitle.into()),
+                ),
+        )
+        .child(match action {
+            Some(action) => action,
+            None => div().into_any_element(),
+        })
         .into_any_element()
 }
 

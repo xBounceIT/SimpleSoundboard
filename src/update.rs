@@ -36,8 +36,6 @@ pub struct SetupAsset {
 pub struct Release {
     /// Version without the `v` prefix.
     pub version: String,
-    /// Release title, for example "SimpleSoundboard 1.1.0".
-    pub title: String,
     /// Release notes in markdown, as written on GitHub.
     pub notes: String,
     pub release_url: String,
@@ -71,8 +69,6 @@ impl Release {
 struct GithubRelease {
     tag_name: String,
     html_url: String,
-    #[serde(default)]
-    name: String,
     #[serde(default)]
     body: String,
     #[serde(default)]
@@ -140,15 +136,9 @@ pub fn fetch_latest() -> Result<Option<Release>, String> {
                 url: asset.browser_download_url.clone(),
             })
         });
-    let title = if release.name.trim().is_empty() {
-        format!("SimpleSoundboard v{version}")
-    } else {
-        release.name.trim().to_string()
-    };
 
     Ok(Some(Release {
         version,
-        title,
         notes: release.body,
         release_url: release.html_url,
         published_at: release.published_at,
@@ -282,7 +272,6 @@ mod tests {
         });
         let newer = Release {
             version: "9.9.9".to_string(),
-            title: "SimpleSoundboard 9.9.9".to_string(),
             notes: "- Something new".to_string(),
             release_url: "https://example.test/release".to_string(),
             published_at: None,
