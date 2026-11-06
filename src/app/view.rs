@@ -2360,7 +2360,7 @@ impl SoundboardApp {
                 h_flex()
                     .w_full()
                     .justify_between()
-                    .items_start()
+                    .items_center()
                     .gap_6()
                     .border_t_1()
                     .border_color(p.line)
