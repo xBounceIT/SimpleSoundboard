@@ -1277,6 +1277,7 @@ impl SoundboardApp {
         } else {
             sound.waveform().to_vec()
         };
+        let waveform = fit_peaks(&waveform, waveform_bar_capacity(tile_width));
 
         let tile_icon = if playing {
             AppIcon::Square
@@ -3293,6 +3294,45 @@ fn placeholder_waveform() -> Vec<f32> {
         .collect()
 }
 
+/// Horizontal space the pad waveform has to itself: `p_4` on both sides plus
+/// the 1px tile border.
+const WAVEFORM_INSET_X: f32 = 34.0;
+
+/// Gap between two waveform bars (`gap_1`) and the thinnest a bar may get.
+const WAVEFORM_BAR_GAP: f32 = 4.0;
+const WAVEFORM_BAR_MIN_WIDTH: f32 = 1.0;
+
+/// Bars the pad waveform can show without spilling out of a pad that is
+/// `tile_width` wide.
+///
+/// Bars sit in a row with a fixed gap, so their minimum footprint is wider
+/// than a narrow pad's content box. Dropping bars there keeps the envelope
+/// inside the tile instead of letting the last ones overflow it.
+fn waveform_bar_capacity(tile_width: f32) -> usize {
+    let inner = (tile_width - WAVEFORM_INSET_X).max(1.0);
+    ((inner + WAVEFORM_BAR_GAP) / (WAVEFORM_BAR_MIN_WIDTH + WAVEFORM_BAR_GAP))
+        .floor()
+        .max(1.0) as usize
+}
+
+/// Max-pool a peak envelope down to at most `bars` values, keeping the
+/// loudest sample of each span so transients survive the reduction.
+fn fit_peaks(peaks: &[f32], bars: usize) -> Vec<f32> {
+    if bars == 0 || peaks.is_empty() {
+        return Vec::new();
+    }
+    if peaks.len() <= bars {
+        return peaks.to_vec();
+    }
+    (0..bars)
+        .map(|bar| {
+            let start = bar * peaks.len() / bars;
+            let end = ((bar + 1) * peaks.len() / bars).max(start + 1);
+            peaks[start..end].iter().copied().fold(0.0f32, f32::max)
+        })
+        .collect()
+}
+
 /// Height of the pad waveform band at rest (`h_6`) and the extra height the
 /// hover zoom adds to it.
 const WAVEFORM_ROW_REMS: f32 = 1.5;
@@ -3328,6 +3368,9 @@ fn waveform_band(
         .size_full()
         .items_end()
         .gap_1()
+        // Belt and braces: if the fitted count is ever off, clip instead of
+        // painting bars over the tile border and the next pad.
+        .overflow_x_hidden()
         .children(peaks.iter().enumerate().map(move |(bar, peak)| {
             let played = super::waveform_bar_filled(bar, count, progress);
             let previewed =
@@ -3476,4 +3519,40 @@ fn vu_meter(level_l: f32, level_r: f32) -> impl IntoElement {
     )
     .w_full()
     .h_32()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        WAVEFORM_BAR_GAP, WAVEFORM_BAR_MIN_WIDTH, WAVEFORM_INSET_X, fit_peaks,
+        waveform_bar_capacity,
+    };
+
+    #[test]
+    fn narrow_pads_fit_the_waveform_inside_the_tile() {
+        // 16rem is the narrowest pad the library lays out.
+        let tile_width = 16.0 * 16.0;
+        let bars = waveform_bar_capacity(tile_width);
+        let used = bars as f32 * WAVEFORM_BAR_MIN_WIDTH + (bars - 1) as f32 * WAVEFORM_BAR_GAP;
+        let available = tile_width - WAVEFORM_INSET_X;
+        assert!(bars > 0);
+        assert!(used <= available, "{used} > {available} with {bars} bars");
+    }
+
+    #[test]
+    fn wide_pads_have_room_for_every_bar() {
+        assert!(waveform_bar_capacity(600.0) >= 48);
+    }
+
+    #[test]
+    fn fit_peaks_pools_neighbours_and_keeps_the_loudest() {
+        let fitted = fit_peaks(&[0.1, 0.9, 0.2, 0.8], 2);
+        assert_eq!(fitted.len(), 2);
+        assert!((fitted[0] - 0.9).abs() < 1e-6);
+        assert!((fitted[1] - 0.8).abs() < 1e-6);
+
+        // Nothing to reduce: the envelope is returned untouched.
+        assert_eq!(fit_peaks(&[0.1, 0.2], 8), vec![0.1, 0.2]);
+        assert!(fit_peaks(&[], 8).is_empty());
+    }
 }
