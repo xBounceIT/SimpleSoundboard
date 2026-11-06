@@ -2349,7 +2349,6 @@ impl SoundboardApp {
 
         v_flex()
             .w_full()
-            .max_w(px(720.0))
             .gap_5()
             .child(settings_heading(
                 "Preferences",
@@ -2359,12 +2358,16 @@ impl SoundboardApp {
             ))
             .child(
                 h_flex()
+                    .w_full()
                     .justify_between()
-                    .items_center()
-                    .gap_3()
-                    .pt_2()
+                    .items_start()
+                    .gap_6()
+                    .border_t_1()
+                    .border_color(p.line)
+                    .pt_4()
                     .child(
                         v_flex()
+                            .flex_1()
                             .min_w_0()
                             .gap_1()
                             .child(
@@ -2376,30 +2379,42 @@ impl SoundboardApp {
                             )
                             .child(
                                 div()
+                                    .max_w(px(640.0))
+                                    .text_sm()
+                                    .line_height(relative(1.45))
+                                    .text_color(p.ink_muted)
+                                    .child(
+                                        "A new pad plays on top of the one already on air instead of \
+                                         interrupting it, so a sting can sit under a voice or two \
+                                         clips can run together. Triggering the same pad again \
+                                         restarts it; stop or Esc still silences everything.",
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
                                     .font_family(MONO_FONT)
                                     .text_xs()
-                                    .line_height(relative(1.3))
                                     .text_color(if self.polyphonic {
                                         p.green
                                     } else {
                                         p.ink_muted
                                     })
-                                    .child(if self.polyphonic {
-                                        "PADS PLAY ON TOP OF EACH OTHER"
-                                    } else {
-                                        "A NEW PAD STOPS THE PREVIOUS ONE"
-                                    }),
+                                    .child(if self.polyphonic { "ON" } else { "OFF" }),
+                            )
+                            .child(
+                                Switch::new("polyphonic")
+                                    .checked(self.polyphonic)
+                                    .accessibility_label("Play pads on top of each other")
+                                    .on_change(cx.listener(|this, checked, _, cx| {
+                                        this.toggle_polyphonic(*checked, cx);
+                                    })),
                             ),
-                    )
-                    .child(
-                        div().flex_shrink_0().child(
-                            Switch::new("polyphonic")
-                                .checked(self.polyphonic)
-                                .accessibility_label("Play pads on top of each other")
-                                .on_change(cx.listener(|this, checked, _, cx| {
-                                    this.toggle_polyphonic(*checked, cx);
-                                })),
-                        ),
                     ),
             )
             .into_any_element()
