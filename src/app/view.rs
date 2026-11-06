@@ -343,6 +343,11 @@ impl SoundboardApp {
                                 div()
                                     .font_family(MONO_FONT)
                                     .text_xs()
+                                    // Cascadia's descent is deeper than Bahnschrift's,
+                                    // so baseline alignment leaves the label ~2px below
+                                    // the title: lift it back onto the same line.
+                                    .relative()
+                                    .top(px(-2.0))
                                     .text_color(p.cream_muted)
                                     .child(update::CURRENT_TAG),
                             ),
