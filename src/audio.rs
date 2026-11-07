@@ -22,7 +22,7 @@ use symphonia::core::{
     meta::MetadataOptions,
 };
 
-use crate::model::SoundId;
+use crate::model::{MAX_SOUND_VOLUME, SoundId, normalize_playback_speed};
 
 const WAVEFORM_BUCKETS: usize = 48;
 const MIC_PREBUFFER_SECONDS: f32 = 0.03;
@@ -93,11 +93,24 @@ impl DeviceChoice {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TransportSnapshot {
     pub sound_id: SoundId,
     pub position: f32,
     pub duration: f32,
+    /// Playback rate of the voice currently driving the transport.
+    pub speed: f32,
+}
+
+impl Default for TransportSnapshot {
+    fn default() -> Self {
+        Self {
+            sound_id: 0,
+            position: 0.0,
+            duration: 0.0,
+            speed: 1.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -118,6 +131,8 @@ struct Voice {
     decoded: Arc<DecodedSound>,
     position: f64,
     gain: f32,
+    /// Playback rate for this pad only.
+    speed: f32,
     looping: bool,
     finished: bool,
 }
@@ -126,6 +141,7 @@ struct CurrentPlayback {
     token: u64,
     sound_id: SoundId,
     duration: f32,
+    speed: f32,
     looping: bool,
 }
 
@@ -334,6 +350,7 @@ impl Mixer {
         decoded: Arc<DecodedSound>,
         gain: f32,
         start_ratio: f32,
+        speed: f32,
     ) {
         if self.polyphonic {
             // Pads stack: only the pad that was triggered again restarts, so
@@ -349,12 +366,14 @@ impl Mixer {
         let frames = decoded.frames() as f64;
         let position =
             (frames * f64::from(start_ratio.clamp(0.0, 1.0))).min((frames - 1.0).max(0.0));
+        let speed = normalize_playback_speed(speed);
         self.voices.push(Voice {
             token,
             sound_id,
             decoded: decoded.clone(),
             position,
-            gain: gain.clamp(0.0, 1.5),
+            gain: gain.clamp(0.0, MAX_SOUND_VOLUME),
+            speed,
             looping: false,
             finished: false,
         });
@@ -362,6 +381,7 @@ impl Mixer {
             token,
             sound_id,
             duration: decoded.duration,
+            speed,
             looping: false,
         });
         self.paused = false;
@@ -383,11 +403,25 @@ impl Mixer {
     }
 
     fn set_sound_volume(&mut self, sound_id: SoundId, volume: f32) {
-        let gain = volume.clamp(0.0, 1.5);
+        let gain = volume.clamp(0.0, MAX_SOUND_VOLUME);
         for voice in &mut self.voices {
             if voice.sound_id == sound_id {
                 voice.gain = gain;
             }
+        }
+    }
+
+    fn set_playback_speed(&mut self, sound_id: SoundId, speed: f32) {
+        let speed = normalize_playback_speed(speed);
+        for voice in &mut self.voices {
+            if voice.sound_id == sound_id {
+                voice.speed = speed;
+            }
+        }
+        if let Some(current) = &mut self.current
+            && current.sound_id == sound_id
+        {
+            current.speed = speed;
         }
     }
 
@@ -427,6 +461,7 @@ impl Mixer {
                 token: voice.token,
                 sound_id: voice.sound_id,
                 duration: voice.decoded.duration,
+                speed: voice.speed,
                 looping: voice.looping,
             });
         self.paused = false;
@@ -536,7 +571,8 @@ impl Mixer {
                 left += (l0 + (l1 - l0) * frac) * voice.gain;
                 right += (r0 + (r1 - r0) * frac) * voice.gain;
 
-                voice.position += voice.decoded.sample_rate as f64 / sample_rate as f64;
+                voice.position +=
+                    f64::from(voice.speed) * voice.decoded.sample_rate as f64 / sample_rate as f64;
                 if voice.position >= total as f64 {
                     if voice.looping {
                         voice.position %= total as f64;
@@ -597,6 +633,7 @@ impl Mixer {
                         sound_id: current.sound_id,
                         position: (voice.position / voice.decoded.sample_rate as f64) as f32,
                         duration: current.duration,
+                        speed: current.speed,
                     })
             }),
             paused: self.paused,
@@ -818,9 +855,10 @@ impl AudioEngine {
         gain: f32,
         looping: bool,
         start_ratio: f32,
+        speed: f32,
     ) {
         let mut mixer = lock_mixer(&self.mixer);
-        mixer.trigger(sound_id, decoded, gain, start_ratio);
+        mixer.trigger(sound_id, decoded, gain, start_ratio, speed);
         mixer.set_current_looping(looping);
     }
 
@@ -842,6 +880,10 @@ impl AudioEngine {
 
     pub fn set_sound_volume(&self, sound_id: SoundId, volume: f32) {
         lock_mixer(&self.mixer).set_sound_volume(sound_id, volume);
+    }
+
+    pub fn set_playback_speed(&self, sound_id: SoundId, speed: f32) {
+        lock_mixer(&self.mixer).set_playback_speed(sound_id, speed);
     }
 
     pub fn set_mic_monitor(&self, enabled: bool) {
@@ -1323,7 +1365,7 @@ mod tests {
     #[test]
     fn the_mixer_renders_and_clears_finished_voices() {
         let mut mixer = Mixer::default();
-        mixer.trigger(42, Arc::new(test_tone(4800)), 1.0, 0.0);
+        mixer.trigger(42, Arc::new(test_tone(4800)), 1.0, 0.0, 1.0);
         assert!(mixer.snapshot().current.is_some());
 
         let mut first = vec![0.0f32; 512 * 2];
@@ -1361,7 +1403,7 @@ mod tests {
             duration: 0.1,
             waveform: Arc::from(vec![1.0f32; WAVEFORM_BUCKETS].into_boxed_slice()),
         };
-        mixer.trigger(3, Arc::new(alternating), 1.0, 0.0);
+        mixer.trigger(3, Arc::new(alternating), 1.0, 0.0, 1.0);
 
         let mut program = vec![0.0f32; 512 * 2];
         let mut voice = vec![0.0f32; 512 * 2];
@@ -1394,18 +1436,18 @@ mod tests {
     #[test]
     fn polyphonic_mixers_keep_the_previous_voice() {
         let mut mixer = Mixer::default();
-        mixer.trigger(1, Arc::new(test_tone(4800)), 1.0, 0.0);
-        mixer.trigger(2, Arc::new(test_tone(4800)), 1.0, 0.0);
+        mixer.trigger(1, Arc::new(test_tone(4800)), 1.0, 0.0, 1.0);
+        mixer.trigger(2, Arc::new(test_tone(4800)), 1.0, 0.0, 1.0);
         assert_eq!(mixer.voices.len(), 1, "exclusive by default");
 
         mixer.polyphonic = true;
-        mixer.trigger(1, Arc::new(test_tone(4800)), 1.0, 0.0);
-        mixer.trigger(2, Arc::new(test_tone(4800)), 1.0, 0.0);
+        mixer.trigger(1, Arc::new(test_tone(4800)), 1.0, 0.0, 1.0);
+        mixer.trigger(2, Arc::new(test_tone(4800)), 1.0, 0.0, 1.0);
         assert_eq!(mixer.voices.len(), 2, "pads stack");
         assert_eq!(mixer.snapshot().playing.len(), 2);
 
         // Triggering the same pad again restarts its voice instead of doubling it.
-        mixer.trigger(2, Arc::new(test_tone(4800)), 1.0, 0.0);
+        mixer.trigger(2, Arc::new(test_tone(4800)), 1.0, 0.0, 1.0);
         assert_eq!(mixer.voices.len(), 2);
         assert_eq!(mixer.snapshot().current.unwrap().sound_id, 2);
     }
@@ -1416,8 +1458,8 @@ mod tests {
             polyphonic: true,
             ..Mixer::default()
         };
-        mixer.trigger(1, Arc::new(test_tone(48_000)), 1.0, 0.0);
-        mixer.trigger(2, Arc::new(test_tone(2_400)), 1.0, 0.0);
+        mixer.trigger(1, Arc::new(test_tone(48_000)), 1.0, 0.0, 1.0);
+        mixer.trigger(2, Arc::new(test_tone(2_400)), 1.0, 0.0, 1.0);
         assert_eq!(mixer.snapshot().current.unwrap().sound_id, 2);
 
         let mut buffer = vec![0.0f32; 4800 * 2];
@@ -1434,9 +1476,61 @@ mod tests {
     }
 
     #[test]
+    fn each_pad_has_its_own_playback_speed() {
+        for (speed, expected) in [(0.25, 0.025), (1.0, 0.1), (2.0, 0.2)] {
+            let mut mixer = Mixer::default();
+            mixer.trigger(5, Arc::new(test_tone(48_000)), 1.0, 0.0, speed);
+
+            let mut buffer = vec![0.0f32; 4800 * 2];
+            mixer.render(&mut buffer, 2, 48_000);
+
+            let position = mixer
+                .snapshot()
+                .current
+                .expect("the clip is still on air")
+                .position;
+            assert!(
+                (position - expected).abs() < 0.001,
+                "{speed}× advanced to {position}, expected {expected}"
+            );
+        }
+
+        // Overlapping voices keep independent rates.
+        let mut mixer = Mixer {
+            polyphonic: true,
+            ..Mixer::default()
+        };
+        mixer.trigger(1, Arc::new(test_tone(48_000)), 1.0, 0.0, 2.0);
+        mixer.trigger(2, Arc::new(test_tone(48_000)), 1.0, 0.0, 0.5);
+
+        let mut buffer = vec![0.0f32; 4800 * 2];
+        mixer.render(&mut buffer, 2, 48_000);
+        let current = mixer.snapshot().current.expect("both voices are on air");
+        assert_eq!(current.sound_id, 2);
+        assert!((current.position - 0.05).abs() < 0.001);
+        assert_eq!(current.speed, 0.5);
+
+        // Dropping the newest voice promotes the slower one with its own rate.
+        mixer.stop_sound(2);
+        let current = mixer.snapshot().current.expect("the first voice survives");
+        assert_eq!(current.sound_id, 1);
+        assert!((current.position - 0.2).abs() < 0.001);
+        assert_eq!(current.speed, 2.0);
+
+        // A live change touches that pad only and snaps to the offered grid.
+        mixer.set_playback_speed(1, 1.1);
+        let current = mixer.snapshot().current.unwrap();
+        assert_eq!(current.speed, 1.0);
+        let before = current.position;
+        mixer.render(&mut buffer, 2, 48_000);
+        let after = mixer.snapshot().current.unwrap().position;
+        assert!((after - before - 0.1).abs() < 0.001);
+    }
+
+    #[test]
     fn pause_holds_the_playhead_and_writes_silence() {
         let mut mixer = Mixer::default();
-        mixer.trigger(7, Arc::new(test_tone(4800)), 1.0, 0.0);
+        mixer.trigger(7, Arc::new(test_tone(4800)), 1.0, 0.0, 1.0);
         mixer.set_paused(true);
 
         let mut buffer = vec![0.0f32; 512 * 2];
@@ -1453,12 +1547,12 @@ mod tests {
     fn a_trigger_can_open_at_an_offset() {
         let mut mixer = Mixer::default();
         // A 0.1s tone opened at the halfway point starts at 0.05s.
-        mixer.trigger(11, Arc::new(test_tone(4800)), 1.0, 0.5);
+        mixer.trigger(11, Arc::new(test_tone(4800)), 1.0, 0.5, 1.0);
         let current = mixer.snapshot().current.unwrap();
         assert!((current.position - 0.05).abs() < 0.001);
 
         // The offset is clamped so the voice always has a frame to play.
-        mixer.trigger(12, Arc::new(test_tone(4800)), 1.0, 1.0);
+        mixer.trigger(12, Arc::new(test_tone(4800)), 1.0, 1.0, 1.0);
         let current = mixer.snapshot().current.unwrap();
         assert!(current.position < current.duration);
     }
@@ -1466,7 +1560,7 @@ mod tests {
     #[test]
     fn looping_keeps_the_transport_alive_past_the_end() {
         let mut mixer = Mixer::default();
-        mixer.trigger(9, Arc::new(test_tone(480)), 1.0, 0.0);
+        mixer.trigger(9, Arc::new(test_tone(480)), 1.0, 0.0, 1.0);
         mixer.set_current_looping(true);
         let mut buffer = vec![0.0f32; 4800 * 2];
         mixer.render(&mut buffer, 2, 48_000);
@@ -1528,7 +1622,7 @@ mod tests {
     #[test]
     fn per_sound_gain_updates_a_live_voice() {
         let mut mixer = Mixer::default();
-        mixer.trigger(31, Arc::new(test_tone(480)), 1.0, 0.0);
+        mixer.trigger(31, Arc::new(test_tone(480)), 1.0, 0.0, 1.0);
         mixer.set_sound_volume(31, 0.25);
         assert!((mixer.voices[0].gain - 0.25).abs() < 0.0001);
         mixer.set_sound_volume(31, 0.75);
@@ -1538,8 +1632,8 @@ mod tests {
     #[test]
     fn a_new_cue_silences_the_previous_one() {
         let mut mixer = Mixer::default();
-        mixer.trigger(1, Arc::new(test_tone(4800)), 1.0, 0.0);
-        mixer.trigger(2, Arc::new(test_tone(4800)), 1.0, 0.0);
+        mixer.trigger(1, Arc::new(test_tone(4800)), 1.0, 0.0, 1.0);
+        mixer.trigger(2, Arc::new(test_tone(4800)), 1.0, 0.0, 1.0);
         assert_eq!(mixer.voices.len(), 1);
         assert_eq!(mixer.snapshot().current.unwrap().sound_id, 2);
     }
@@ -1572,7 +1666,7 @@ mod tests {
     #[test]
     fn a_finished_voice_cannot_keep_the_transport_alive() {
         let mut mixer = Mixer::default();
-        mixer.trigger(77, Arc::new(test_tone(4800)), 1.0, 0.0);
+        mixer.trigger(77, Arc::new(test_tone(4800)), 1.0, 0.0, 1.0);
         mixer.voices[0].finished = true;
         assert!(mixer.snapshot().current.is_none());
     }
@@ -1587,7 +1681,7 @@ mod tests {
             waveform: Arc::from(vec![0.1f32; WAVEFORM_BUCKETS].into_boxed_slice()),
         };
         let mut mixer = Mixer::default();
-        mixer.trigger(78, Arc::new(sound), 1.0, 0.0);
+        mixer.trigger(78, Arc::new(sound), 1.0, 0.0, 1.0);
         let mut buffer = vec![0.0f32; 48_000 * 2 * 3];
         mixer.render(&mut buffer, 2, 48_000);
         assert!(mixer.snapshot().current.is_none());

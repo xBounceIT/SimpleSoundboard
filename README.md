@@ -19,9 +19,10 @@ A desktop audio console for routing clips and voice into a virtual microphone, b
 - **Headphones only**: keep the clips on the headphones and leave the virtual microphone to your voice, so nothing from the bank reaches the call.
 - **Settings page**: check for updates, install them and read the release notes in a dedicated panel, all without leaving the app.
 - **Overlapping sounds** (off by default): let pads stack on top of each other instead of interrupting the previous clip.
+- **Playback speed per pad** from 0.25× to 2×: click the clock in a pad's bottom row and drag the raised slider. The rate applies live to that sound only, snaps to 0.25× steps, and is saved with the bank.
 - Shows a two-needle analog VU meter for the output and a signal indicator for the microphone.
-- Controls: previous, play/pause, stop, next, loop, seek, master volume and **independent volume per pad**.
-- Remembers the bank, names, trims, volumes, devices, monitor, headphones-only route and page size in `%APPDATA%\SimpleSoundboard\state.json`. Development builds use a separate profile in `%APPDATA%\SimpleSoundboard-Dev\state.json`.
+- Controls: previous, play/pause, stop, next, loop, seek, master volume, **independent volume per pad** (up to 200% for a boost) and **independent playback speed per pad**.
+- Remembers the bank, names, trims, volumes, per-pad speeds, devices, monitor, headphones-only route and page size in `%APPDATA%\SimpleSoundboard\state.json`. Development builds use a separate profile in `%APPDATA%\SimpleSoundboard-Dev\state.json`.
 - Checks for updates on every launch and, when a newer version exists, shows a bottom-right notification with **Update now** and **See changes**; the second opens the settings page on the release notes.
 
 ## Routing to Discord
@@ -49,7 +50,9 @@ To reorder the bank, grab the grid handle in the upper corner of a pad and drag 
 
 To assign a keyboard shortcut, right-click a pad and choose **Set shortcut…**. The pad enters capture mode: press a combination such as `Ctrl+Alt+1` or `F5`. Shortcuts without Ctrl/Alt (except F-keys) and combinations reserved by the app are rejected. Use **Clear shortcut** in the same menu to remove it; the assigned keys appear next to the pad title.
 
-Every pad always shows its volume slider in the bottom row, with the percentage next to it. Drag it to adjust that sound: the change is heard immediately, even while the clip is playing, and is saved. The pad volume is multiplied by the overall **MASTER** volume.
+Every pad always shows its volume slider in the bottom row, with the percentage next to it. Drag it to adjust that sound from 0% to 200%: values above 100% boost quiet clips and turn the slider amber. The change is heard immediately, even while the clip is playing, and is saved. The pad volume is multiplied by the overall **MASTER** volume.
+
+The **clock** button in a pad's bottom row opens that pad's playback-speed slider in a raised panel above the pad. Choose 0.25×, 0.5×, 0.75×, 1×, 1.25×, 1.5×, 1.75× or 2×; the new rate is applied while the clip keeps playing and only affects that sound. The clock turns amber whenever the pad's rate is not 1×, and the choice is saved with the bank.
 
 ![Trim editor with the selected portion, start and end handles and the Audition command](docs/trim.png)
 
@@ -102,7 +105,7 @@ The app uses these crates:
 
 ## Settings
 
-The gear in the title bar opens a settings page: a category list on the left, the selected category on the right, with **Esc** or **Back to the board** to leave it.
+The **sidebar** on the left switches between the soundboard and the settings page; its gear sits at the bottom and shows a dot when an update is available. The gear opens a settings page: a category list on the left, the selected category on the right, with **Esc** or **Back to the board** to leave it.
 
 - **PREFERENCES** holds the behaviour switches. **Overlapping sounds** lets a new pad start without stopping the one on air: every pad keeps its own voice, the pad that was triggered again restarts, and the transport follows the newest voice — when it ends, the bar moves to whichever pad is still playing. Leaving it off keeps the classic exclusive cue.
 - **ABOUT** is the app's identity and update centre: the running version, the latest published release and two actions — **Check for updates** asks GitHub again, **Install update** downloads the setup, verifies it is a Windows executable, runs it silently and closes the app while it replaces the files — followed by the release notes in a scrollable panel (headings, bullet points, full-changelog link, **Open on GitHub** for the full page) and the `state.json` the bank is saved to.
@@ -139,7 +142,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-The 34 tests cover WAV and MP3 decoding, mixing, pause, loop, end of voice (including WAV files at a different sample rate), trigger exclusivity and polyphonic stacking, audio trimming, the monitor buffer, headphones-only routing, the library layout, release-note parsing, device preferences, virtual device detection, version comparison, setup asset selection and keyboard shortcut validation.
+The 44 tests cover WAV and MP3 decoding, mixing, pause, loop, end of voice (including WAV files at a different sample rate), trigger exclusivity and polyphonic stacking, independent per-pad playback speeds, audio trimming, the monitor buffer, headphones-only routing, the library layout, release-note parsing, device preferences, virtual device detection, version comparison, setup asset selection and keyboard shortcut validation.
 
 Main structure:
 
@@ -149,7 +152,7 @@ src/theme.rs       palette and theme tokens
 src/model.rs       bank model, trims and formatting
 src/audio.rs       cpal, symphonia, mixer and headphone monitor
 src/app.rs         app state, persistence, actions
-src/app/view.rs    layout, custom title bar, pad wall, routing, transport, settings page and update toast
+src/app/view.rs    layout, sidebar, custom title bar, pad wall, routing, transport, settings page and update toast
 src/update.rs      GitHub release, release notes, setup download and launch
 installer/         Inno Setup script for the Windows setup
 .github/workflows/release.yml  build and publish the release on vX.Y.Z tags
@@ -162,10 +165,10 @@ Releases are automated: [`.github/workflows/release.yml`](.github/workflows/rele
 Before tagging, the `version` in `Cargo.toml` must match the tag: the workflow refuses to publish if they differ.
 
 ```powershell
-# Cargo.toml: version = "1.1.1"
+# Cargo.toml: version = "1.2.0"
 git add .
-git commit -m "Release v1.1.1"
-git tag v1.1.1
+git commit -m "Release v1.2.0"
+git tag v1.2.0
 git push origin main --tags
 ```
 
@@ -173,8 +176,8 @@ To build the setup locally, install [Inno Setup 6](https://jrsoftware.org/isinfo
 
 ```powershell
 cargo build --release
-& 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer\simple-soundboard.iss /DAppVersion=1.1.1
-# dist\SimpleSoundboard-Setup-1.1.1.exe
+& 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer\simple-soundboard.iss /DAppVersion=1.2.0
+# dist\SimpleSoundboard-Setup-1.2.0.exe
 ```
 
 ## Limitations

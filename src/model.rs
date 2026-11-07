@@ -10,6 +10,45 @@ use crate::audio::DecodedSound;
 
 pub type SoundId = u64;
 
+/// Loudest a pad volume may go. Values above 100% are a boost for quiet
+/// clips; the mixer still clamps the final sample to the output range.
+pub const MAX_SOUND_VOLUME: f32 = 2.0;
+
+/// Playback rates offered by each pad, slowest first.
+pub const PLAYBACK_SPEEDS: [f32; 8] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+
+/// Slowest and fastest rate a pad can play at.
+pub const MIN_PLAYBACK_SPEED: f32 = PLAYBACK_SPEEDS[0];
+pub const MAX_PLAYBACK_SPEED: f32 = PLAYBACK_SPEEDS[PLAYBACK_SPEEDS.len() - 1];
+
+/// Snap a rate to the closest entry in [`PLAYBACK_SPEEDS`].
+///
+/// Saved JSON is user-editable and the mixer must never see an arbitrary
+/// rate: finite values snap to the nearest offered speed, while broken values
+/// fall back to normal speed.
+pub fn normalize_playback_speed(speed: f32) -> f32 {
+    if !speed.is_finite() {
+        return 1.0;
+    }
+    PLAYBACK_SPEEDS
+        .into_iter()
+        .min_by(|a, b| (a - speed).abs().total_cmp(&(b - speed).abs()))
+        .unwrap_or(1.0)
+}
+
+/// Format a playback rate without trailing zeros: `0.25×`, `1×`, `1.5×`.
+pub fn format_playback_speed(speed: f32) -> String {
+    let speed = normalize_playback_speed(speed);
+    let hundredths = (speed * 100.0).round() as u32;
+    if hundredths.is_multiple_of(100) {
+        format!("{speed:.0}×")
+    } else if hundredths.is_multiple_of(50) {
+        format!("{speed:.1}×")
+    } else {
+        format!("{speed:.2}×")
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyShortcut {
     #[serde(default)]
@@ -129,6 +168,8 @@ pub struct Sound {
     pub path: PathBuf,
     pub title: SharedString,
     pub volume: f32,
+    /// Playback rate for this pad only, snapped to the offered speeds.
+    pub playback_speed: f32,
     pub status: SoundStatus,
     /// The complete decoded file. Retained so the clip can be trimmed more
     /// than once without decoding the file again.
@@ -149,7 +190,8 @@ impl Sound {
             id,
             path,
             title,
-            volume: volume.clamp(0.0, 1.0),
+            volume: volume.clamp(0.0, MAX_SOUND_VOLUME),
+            playback_speed: 1.0,
             status: SoundStatus::Loading,
             source: None,
             decoded: None,
@@ -305,7 +347,10 @@ pub fn format_time_precise(seconds: f32) -> String {
 }
 
 pub fn format_percent(value: f32) -> String {
-    format!("{:>3.0}%", (value.clamp(0.0, 1.0) * 100.0).round())
+    format!(
+        "{:>3.0}%",
+        (value.clamp(0.0, MAX_SOUND_VOLUME) * 100.0).round()
+    )
 }
 
 pub fn normalize_peak(value: f32) -> f32 {
@@ -325,8 +370,12 @@ pub fn peak_to_db(value: f32) -> Option<f32> {
 }
 #[cfg(test)]
 mod tests {
-    use super::KeyShortcut;
+    use super::{
+        KeyShortcut, PLAYBACK_SPEEDS, Sound, format_percent, format_playback_speed,
+        normalize_playback_speed,
+    };
     use gpui_kit::{Keystroke, Modifiers};
+    use std::path::PathBuf;
 
     fn keystroke(key: &str, control: bool, alt: bool, shift: bool) -> Keystroke {
         Keystroke {
@@ -348,6 +397,49 @@ mod tests {
         assert!(KeyShortcut::from_keystroke(&keystroke("f5", false, false, false)).is_some());
         assert!(KeyShortcut::from_keystroke(&keystroke("a", false, false, false)).is_none());
         assert!(KeyShortcut::from_keystroke(&keystroke("control", true, false, false)).is_none());
+    }
+
+    #[test]
+    fn playback_speeds_snap_to_the_offered_rates() {
+        for (speed, expected) in [
+            (0.1, 0.25),
+            (0.25, 0.25),
+            (0.37, 0.25),
+            (0.4, 0.5),
+            (0.6, 0.5),
+            (0.65, 0.75),
+            (0.9, 1.0),
+            (1.12, 1.0),
+            (1.13, 1.25),
+            (1.49, 1.5),
+            (1.9, 2.0),
+            (3.0, 2.0),
+            (f32::NAN, 1.0),
+            (f32::INFINITY, 1.0),
+        ] {
+            assert_eq!(normalize_playback_speed(speed), expected, "{speed}");
+        }
+    }
+
+    #[test]
+    fn playback_speed_labels_skip_trailing_zeros() {
+        assert_eq!(format_playback_speed(0.25), "0.25×");
+        assert_eq!(format_playback_speed(0.5), "0.5×");
+        assert_eq!(format_playback_speed(0.75), "0.75×");
+        assert_eq!(format_playback_speed(1.0), "1×");
+        assert_eq!(format_playback_speed(1.25), "1.25×");
+        assert_eq!(format_playback_speed(1.5), "1.5×");
+        assert_eq!(format_playback_speed(2.0), "2×");
+        assert_eq!(PLAYBACK_SPEEDS.len(), 8);
+    }
+
+    #[test]
+    fn pad_volume_accepts_a_boost_up_to_two_hundred_percent() {
+        let sound = Sound::new(PathBuf::from("clip.mp3"), 3.0);
+        assert_eq!(sound.volume, 2.0);
+        assert_eq!(sound.playback_speed, 1.0);
+        assert_eq!(format_percent(2.0), "200%");
+        assert_eq!(format_percent(1.0), "100%");
     }
 
     #[test]

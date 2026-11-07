@@ -8,6 +8,7 @@ use gpui_kit::component::{
     h_flex,
     input::Input,
     menu::{ContextMenuExt as _, PopupMenuItem},
+    popover::Popover,
     scroll::ScrollableElement as _,
     select::Select,
     slider::Slider,
@@ -15,7 +16,7 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    AnimationExt as _, AnyElement, App, AppContext as _, Bounds, ClickEvent, CursorStyle,
+    Anchor, AnimationExt as _, AnyElement, App, AppContext as _, Bounds, ClickEvent, CursorStyle,
     ExternalPaths, FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, PathBuilder,
     Render, SharedString, SpringAnimation, SpringConfig, StatefulInteractiveElement as _,
@@ -23,11 +24,11 @@ use gpui_kit::{
     quad, relative, rems, size, transparent_black,
 };
 
-use super::{SettingsSection, SoundboardApp, TrimDrag};
+use super::{ROUTING_PANEL_WIDTH_REM, SIDEBAR_WIDTH_REM, SettingsSection, SoundboardApp, TrimDrag};
 use crate::{
     model::{
-        Sound, SoundId, SoundStatus, format_duration, format_percent, format_time_precise,
-        normalize_peak, peak_to_db,
+        Sound, SoundId, SoundStatus, format_duration, format_percent, format_playback_speed,
+        format_time_precise, normalize_peak, peak_to_db,
     },
     theme::{BODY_FONT, DISPLAY_FONT, MONO_FONT, Palette, palette},
     update,
@@ -40,11 +41,12 @@ impl Render for SoundboardApp {
         cx: &mut gpui_kit::Context<Self>,
     ) -> impl IntoElement {
         let p = palette();
-        let body = if self.settings_open {
+        let content = if self.settings_open {
             self.render_settings(cx)
         } else {
             div()
                 .flex_1()
+                .min_w_0()
                 .min_h_0()
                 .flex()
                 .items_stretch()
@@ -52,6 +54,21 @@ impl Render for SoundboardApp {
                 .child(self.render_routing(cx))
                 .into_any_element()
         };
+        let body = div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .items_stretch()
+            .child(self.render_sidebar(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex()
+                    .items_stretch()
+                    .child(content),
+            );
         let toast = if self.settings_open {
             div().into_any_element()
         } else {
@@ -90,6 +107,48 @@ impl Render for SoundboardApp {
 }
 
 impl SoundboardApp {
+    fn render_sidebar(&mut self, cx: &mut gpui_kit::Context<Self>) -> impl IntoElement {
+        let p = palette();
+        let board_active = !self.settings_open;
+        let settings_active = self.settings_open;
+        let update_available = self.available_update.is_some();
+
+        let board = sidebar_nav_button(
+            cx,
+            "nav-board",
+            AppIcon::LayoutGrid,
+            "BOARD",
+            board_active,
+            false,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)));
+
+        let settings = sidebar_nav_button(
+            cx,
+            "open-settings",
+            AppIcon::Settings,
+            "SETTINGS",
+            settings_active,
+            update_available,
+        )
+        .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx)));
+
+        v_flex()
+            .id("sidebar")
+            .w(rems(SIDEBAR_WIDTH_REM))
+            .h_full()
+            .flex_shrink_0()
+            .items_center()
+            .py_3()
+            .gap_2()
+            .bg(p.console)
+            .border_r_1()
+            .border_color(p.console_line)
+            .child(board)
+            .child(div().flex_1())
+            .child(settings)
+    }
+
     fn render_shortcut_capture(&self, cx: &mut gpui_kit::Context<Self>) -> AnyElement {
         let p = palette();
         let Some(id) = self.shortcut_target else {
@@ -402,36 +461,9 @@ impl SoundboardApp {
             WindowControlAction::Close,
         );
 
-        let settings = Button::new("open-settings")
-            .icon(
-                Icon::new(AppIcon::Settings)
-                    .size_3p5()
-                    .text_color(if self.settings_open { p.amber } else { p.cream }),
-            )
-            .custom(
-                ButtonCustomVariant::new(cx)
-                    .color(if self.settings_open {
-                        p.console_hi
-                    } else {
-                        p.console
-                    })
-                    .foreground(p.cream)
-                    .hover(p.console_hi)
-                    .active(p.console_line),
-            )
-            .w_12()
-            .h_full()
-            .p_0()
-            .rounded(px(0.0))
-            .tab_stop(false)
-            .accessibility_label("Settings")
-            .tooltip("Settings · updates and release notes")
-            .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx)));
-
         let controls = h_flex()
             .h_full()
             .flex_shrink_0()
-            .child(settings)
             .child(minimize)
             .child(maximize)
             .child(close);
@@ -471,7 +503,8 @@ impl SoundboardApp {
             let list = if filtered.is_empty() {
                 self.render_no_results(cx).into_any_element()
             } else {
-                self.render_grid(&page_indices, metrics.tile_width, cx)
+                let tile = metrics.tile_size_for_page(page_indices.len(), per_page);
+                self.render_grid(&page_indices, tile.width, tile.height, cx)
                     .into_any_element()
             };
             let count = filtered.len();
@@ -1191,6 +1224,7 @@ impl SoundboardApp {
         &mut self,
         indices: &[usize],
         tile_width: f32,
+        tile_height: f32,
         cx: &mut gpui_kit::Context<Self>,
     ) -> impl IntoElement {
         let p = palette();
@@ -1201,7 +1235,7 @@ impl SoundboardApp {
         let mut tiles = Vec::with_capacity(sounds.len());
         for (index, sound) in sounds.iter() {
             tiles.push(
-                self.render_sound_tile(*index, sound, tile_width, cx)
+                self.render_sound_tile(*index, sound, tile_width, tile_height, cx)
                     .into_any_element(),
             );
         }
@@ -1232,6 +1266,7 @@ impl SoundboardApp {
         index: usize,
         sound: &Sound,
         tile_width: f32,
+        tile_height: f32,
         cx: &mut gpui_kit::Context<Self>,
     ) -> impl IntoElement {
         let p = palette();
@@ -1287,6 +1322,10 @@ impl SoundboardApp {
 
         let renaming = self.rename_target == Some(id);
         let volume_slider = self.volume_sliders.get(&id).cloned();
+        let speed_slider = self.speed_sliders.get(&id).cloned();
+        let speed_changed = (sound.playback_speed - 1.0).abs() > f32::EPSILON;
+        let speed_label = format_playback_speed(sound.playback_speed);
+        let boosted = sound.volume > 1.0;
         // The pad overlay owns every click above the volume row. It needs the
         // waveform bounds so a click there can seek instead of toggling.
         let waveform_seek = sound.is_ready() && !renaming;
@@ -1302,6 +1341,85 @@ impl SoundboardApp {
         };
         let duration_seconds = sound.duration();
         let hover_time = waveform_hover.map(|ratio| format_time_precise(duration_seconds * ratio));
+        let speed_control = if renaming {
+            div().into_any_element()
+        } else if let Some(slider) = speed_slider {
+            let label = speed_label.clone();
+            let trigger = Button::new(("pad-speed", id))
+                .custom(
+                    ButtonCustomVariant::new(cx)
+                        .color(if speed_changed { p.console_hi } else { p.tile })
+                        .foreground(if speed_changed {
+                            p.amber
+                        } else {
+                            p.cream_muted
+                        })
+                        .hover(p.tile_hover)
+                        .active(p.tile_active),
+                )
+                .size_6()
+                .p_0()
+                .rounded(cx.theme().radius)
+                .tab_stop(false)
+                .icon(
+                    Icon::new(AppIcon::Clock)
+                        .size_3()
+                        .text_color(if speed_changed {
+                            p.amber
+                        } else {
+                            p.cream_muted
+                        }),
+                )
+                .accessibility_label(format!("Playback speed {speed_label}"))
+                .tooltip(format!("Pad speed · {speed_label}"));
+            Popover::new(("pad-speed-popover", id))
+                .anchor(Anchor::BottomCenter)
+                .arrow(true)
+                .trigger(trigger)
+                .content(move |_, _, _| {
+                    let label = label.clone();
+                    v_flex()
+                        .w_56()
+                        .gap_3()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_xs()
+                                        .text_color(p.cream_muted)
+                                        .child("PAD SPEED"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_xs()
+                                        .text_color(if speed_changed { p.amber } else { p.cream })
+                                        .child(label),
+                                ),
+                        )
+                        .child(
+                            Slider::new(&slider)
+                                .bg(p.amber)
+                                .text_color(p.cream)
+                                .accessibility_label("Pad playback speed"),
+                        )
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .font_family(MONO_FONT)
+                                .text_xs()
+                                .text_color(p.cream_muted)
+                                .child("0.25×")
+                                .child("2×"),
+                        )
+                })
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
         let content = div()
             .size_full()
             .p_4()
@@ -1505,7 +1623,9 @@ impl SoundboardApp {
                                     volume_slider.clone(),
                                     |this, slider| {
                                         this.child(
-                                            Slider::new(&slider).bg(p.blue).text_color(p.cream),
+                                            Slider::new(&slider)
+                                                .bg(if boosted { p.amber } else { p.blue })
+                                                .text_color(p.cream),
                                         )
                                     },
                                 ),
@@ -1514,10 +1634,11 @@ impl SoundboardApp {
                                 div()
                                     .font_family(MONO_FONT)
                                     .text_xs()
-                                    .text_color(p.cream_muted)
+                                    .text_color(if boosted { p.amber } else { p.cream_muted })
                                     .child(format_percent(sound.volume)),
                             ),
                     )
+                    .child(speed_control)
                     .child(if renaming {
                         h_flex()
                             .gap_1()
@@ -1687,7 +1808,7 @@ impl SoundboardApp {
         let wrapper = div()
             .id(("sound-wrap", id))
             .w(px(tile_width))
-            .h_48()
+            .h(px(tile_height))
             .flex_shrink_0()
             .on_hover(cx.listener(move |this, is_hovered, _, cx| {
                 let next = if *is_hovered {
@@ -2195,7 +2316,7 @@ impl SoundboardApp {
             );
 
         div()
-            .w_80()
+            .w(rems(ROUTING_PANEL_WIDTH_REM))
             .h_full()
             .flex_shrink_0()
             .min_h_0()
@@ -3239,6 +3360,62 @@ fn release_notes_body(body: &str) -> AnyElement {
         .pb_2()
         .children(rows)
         .into_any_element()
+}
+
+fn sidebar_nav_button(
+    cx: &App,
+    id: &'static str,
+    icon: AppIcon,
+    label: &'static str,
+    active: bool,
+    alert: bool,
+) -> Button {
+    let p = palette();
+    let color = if active { p.cream } else { p.cream_muted };
+    let icon_color = if active { p.amber } else { color };
+    Button::new(id)
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .color(if active { p.console_hi } else { p.console })
+                .foreground(color)
+                .hover(p.console_hi)
+                .active(p.console_line),
+        )
+        .w(px(64.0))
+        .h(px(54.0))
+        .p_0()
+        .rounded(cx.theme().radius_lg)
+        .tab_stop(false)
+        .accessibility_label(label)
+        .tooltip(label)
+        .child(
+            v_flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .relative()
+                        .child(Icon::new(icon).size_5().text_color(icon_color))
+                        .when(alert, |this| {
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .top(px(-2.0))
+                                    .right(px(-4.0))
+                                    .size_1p5()
+                                    .rounded_full()
+                                    .bg(p.signal),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .font_family(MONO_FONT)
+                        .text_xs()
+                        .text_color(color)
+                        .child(label),
+                ),
+        )
 }
 
 fn console_icon_button(

@@ -21,7 +21,8 @@ use smol::Timer;
 use crate::{
     audio::{self, AudioEngine, DeviceChoice, TransportSnapshot},
     model::{
-        KeyShortcut, Sound, SoundId, SoundStatus, format_percent, is_supported_audio, sound_id,
+        KeyShortcut, MAX_PLAYBACK_SPEED, MAX_SOUND_VOLUME, MIN_PLAYBACK_SPEED, Sound, SoundId,
+        SoundStatus, format_percent, is_supported_audio, normalize_playback_speed, sound_id,
     },
     update::{self, AvailableUpdate},
 };
@@ -53,6 +54,22 @@ const MIN_TILE_WIDTH_REM: f32 = 16.0;
 
 /// Ceiling on the Auto column count, so 4K windows still get readable pads.
 const MAX_AUTO_COLUMNS: usize = 10;
+
+/// Resting height of a pad, in rem (`h_48` in the grid).
+const TILE_HEIGHT_REM: f32 = 12.0;
+
+/// Width of the navigation rail on the left, in rem. The library geometry
+/// reserves this space so Auto never sizes pads for a window that is wider
+/// than the area they actually get.
+pub(crate) const SIDEBAR_WIDTH_REM: f32 = 5.0;
+
+/// Width of the routing console on the right, in rem.
+pub(crate) const ROUTING_PANEL_WIDTH_REM: f32 = 20.0;
+
+/// Ceiling for a pad enlarged on a page that holds fewer sounds than its
+/// page-size slots. Twice the resting height is enough to use the free space
+/// without turning a single result into a full-screen tile.
+const MAX_GROWN_TILE_HEIGHT_REM: f32 = 24.0;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PersistedState {
@@ -94,6 +111,9 @@ struct PersistedSound {
     path: String,
     #[serde(default = "default_volume")]
     volume: f32,
+    /// Playback rate for this pad, from `0.25` to `2.0`.
+    #[serde(default = "default_playback_speed")]
+    playback_speed: f32,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -105,6 +125,10 @@ struct PersistedSound {
 }
 
 fn default_volume() -> f32 {
+    1.0
+}
+
+fn default_playback_speed() -> f32 {
     1.0
 }
 
@@ -212,14 +236,28 @@ fn page_size_labels() -> Vec<SharedString> {
 /// Pad geometry for the current window, shared by the page-size calculation
 /// and by the grid that renders the pads, so the two can never disagree.
 pub(crate) struct LibraryMetrics {
-    /// Pads per row. The grid only needs [`tile_width`](Self::tile_width), so
-    /// this is read by the layout tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Pads per row.
     columns: usize,
     /// Width of a single pad, in pixels.
     pub(crate) tile_width: f32,
     /// Sounds that fill the window with whole rows.
     per_page: usize,
+    /// Width available to a row, with the same slack the grid uses.
+    usable_width: f32,
+    /// Height available to every row on the page.
+    content_height: f32,
+    /// Gap between pads, in pixels.
+    gap: f32,
+    /// Standard pad height and the ceiling for a page that is not full.
+    base_tile_height: f32,
+    max_tile_height: f32,
+}
+
+/// Size of the pads on one library page.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TileSize {
+    pub(crate) width: f32,
+    pub(crate) height: f32,
 }
 
 impl LibraryMetrics {
@@ -238,6 +276,8 @@ impl LibraryMetrics {
     ///
     /// * a 4rem title bar (`h_16`) and a 6rem transport bar (`h_24`) sit above
     ///   and below the library;
+    /// * the 5rem navigation rail and 20rem routing console share the row with
+    ///   the library;
     /// * the library toolbar adds 3.75rem (`pt_5` + the 2rem search field +
     ///   `pb_2`) and the pagination footer 3rem (`py_3` around small controls);
     /// * pads are 12rem tall (`h_48`), at least [`MIN_TILE_WIDTH_REM`] wide,
@@ -253,7 +293,8 @@ impl LibraryMetrics {
     /// Keep those values in sync if the layout around the library changes.
     fn for_viewport(width: f32, height: f32, rem: f32) -> Self {
         let rem = rem.max(1.0);
-        let library_width = (width - 20.0 * rem).max(1.0); // routing panel `w_80`
+        let chrome_width = (SIDEBAR_WIDTH_REM + ROUTING_PANEL_WIDTH_REM) * rem;
+        let library_width = (width - chrome_width).max(1.0);
         let content_width = (library_width - 2.5 * rem).max(1.0); // grid `px_5`
         let gap = 0.75 * rem;
         let min_tile_width = MIN_TILE_WIDTH_REM * rem;
@@ -266,13 +307,48 @@ impl LibraryMetrics {
 
         let grid_height = (height - 16.75 * rem).max(0.0);
         let content_height = (grid_height - 2.0 * rem).max(0.0);
-        let rows = (((content_height + gap) / (12.0 * rem + gap)).floor() as usize).max(1);
+        let rows =
+            (((content_height + gap) / (TILE_HEIGHT_REM * rem + gap)).floor() as usize).max(1);
 
         Self {
             columns,
             tile_width,
             per_page: (columns * rows).clamp(1, MAX_AUTO_PAGE_SIZE),
+            usable_width,
+            content_height,
+            gap,
+            base_tile_height: TILE_HEIGHT_REM * rem,
+            max_tile_height: MAX_GROWN_TILE_HEIGHT_REM * rem,
         }
+    }
+
+    /// Pad size for a page that actually shows `visible` sounds.
+    ///
+    /// A full page keeps the standard grid. A shorter page (last page of the
+    /// bank, filtered results, or a large fixed per-page size) spreads the
+    /// same free width and height over the sounds it has, so the pads grow
+    /// instead of leaving the page half empty. The height stops at twice the
+    /// resting size to keep a lone result from becoming a full-screen tile.
+    pub(crate) fn tile_size_for_page(&self, visible: usize, per_page: usize) -> TileSize {
+        if visible == 0 || visible >= per_page.max(1) {
+            return TileSize {
+                width: self.tile_width,
+                height: self.base_tile_height,
+            };
+        }
+
+        // Near-square counts look best with a square-ish layout: four pads
+        // become 2×2 instead of a wide row with one lonely pad underneath.
+        let columns = ((visible as f32).sqrt().ceil() as usize).clamp(1, self.columns);
+        let rows = visible.div_ceil(columns).max(1);
+        let width = ((self.usable_width - self.gap * columns.saturating_sub(1) as f32)
+            / columns as f32)
+            .max(1.0);
+        let height = ((self.content_height - self.gap * rows.saturating_sub(1) as f32)
+            / rows as f32)
+            .clamp(self.base_tile_height, self.max_tile_height);
+
+        TileSize { width, height }
     }
 }
 
@@ -368,6 +444,7 @@ pub struct SoundboardApp {
     master_slider: Entity<SliderState>,
     seek_slider: Entity<SliderState>,
     volume_sliders: HashMap<SoundId, Entity<SliderState>>,
+    speed_sliders: HashMap<SoundId, Entity<SliderState>>,
 
     rename_target: Option<SoundId>,
     rename_input: Entity<InputState>,
@@ -578,6 +655,7 @@ impl SoundboardApp {
                 continue;
             }
             let mut sound = Sound::new(path, saved.volume);
+            sound.playback_speed = normalize_playback_speed(saved.playback_speed);
             if let Some(title) = saved
                 .title
                 .as_ref()
@@ -656,6 +734,7 @@ impl SoundboardApp {
             master_slider,
             seek_slider,
             volume_sliders: HashMap::new(),
+            speed_sliders: HashMap::new(),
             rename_target: None,
             rename_input,
             trim_target: None,
@@ -831,6 +910,15 @@ impl SoundboardApp {
             app.attach_volume_slider(id, volume, window, cx);
         }
 
+        let initial_speeds: Vec<(SoundId, f32)> = app
+            .sounds
+            .iter()
+            .map(|sound| (sound.id, sound.playback_speed))
+            .collect();
+        for (id, speed) in initial_speeds {
+            app.attach_speed_slider(id, speed, window, cx);
+        }
+
         if !app.sounds.is_empty() {
             let paths: Vec<(SoundId, PathBuf)> = app
                 .sounds
@@ -937,19 +1025,20 @@ impl SoundboardApp {
         let slider = cx.new(|_| {
             SliderState::new()
                 .min(0.0)
-                .max(100.0)
+                .max(MAX_SOUND_VOLUME * 100.0)
                 .step(1.0)
-                .default_value(volume.clamp(0.0, 1.0) * 100.0)
+                .default_value(volume.clamp(0.0, MAX_SOUND_VOLUME) * 100.0)
         });
         let subscription = cx.subscribe_in(
             &slider,
             window,
             move |this, _, event: &SliderEvent, _window, cx| match event {
                 SliderEvent::Change(value) => {
-                    this.apply_sound_volume_value(id, value.start() / 100.0, false, cx);
+                    this.apply_sound_volume_value(id, value.start() / 100.0, cx);
                 }
                 SliderEvent::Release(value) => {
-                    this.apply_sound_volume_value(id, value.start() / 100.0, true, cx);
+                    this.apply_sound_volume_value(id, value.start() / 100.0, cx);
+                    this.save_state();
                 }
             },
         );
@@ -957,21 +1046,61 @@ impl SoundboardApp {
         self._subscriptions.push(subscription);
     }
 
-    fn apply_sound_volume_value(
-        &mut self,
-        id: SoundId,
-        volume: f32,
-        persist: bool,
-        cx: &mut Context<Self>,
-    ) {
+    fn apply_sound_volume_value(&mut self, id: SoundId, volume: f32, cx: &mut Context<Self>) {
         let Some(sound) = self.sounds.iter_mut().find(|sound| sound.id == id) else {
             return;
         };
-        sound.volume = volume.clamp(0.0, 1.0);
+        sound.volume = volume.clamp(0.0, MAX_SOUND_VOLUME);
         self.audio.set_sound_volume(id, sound.volume);
-        if persist {
-            self.save_state();
+        cx.notify();
+    }
+
+    fn attach_speed_slider(
+        &mut self,
+        id: SoundId,
+        speed: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.speed_sliders.contains_key(&id) {
+            return;
         }
+        let slider = cx.new(|_| {
+            SliderState::new()
+                .min(MIN_PLAYBACK_SPEED)
+                .max(MAX_PLAYBACK_SPEED)
+                .step(0.25)
+                .default_value(normalize_playback_speed(speed))
+        });
+        let subscription = cx.subscribe_in(
+            &slider,
+            window,
+            move |this, _, event: &SliderEvent, _window, cx| match event {
+                SliderEvent::Change(value) => {
+                    this.apply_sound_speed(id, value.start(), cx);
+                }
+                SliderEvent::Release(value) => {
+                    this.apply_sound_speed(id, value.start(), cx);
+                    // Change fires for every drag step, so the release often
+                    // carries the value already applied: save it regardless.
+                    this.save_state();
+                }
+            },
+        );
+        self.speed_sliders.insert(id, slider);
+        self._subscriptions.push(subscription);
+    }
+
+    fn apply_sound_speed(&mut self, id: SoundId, speed: f32, cx: &mut Context<Self>) {
+        let speed = normalize_playback_speed(speed);
+        let Some(sound) = self.sounds.iter_mut().find(|sound| sound.id == id) else {
+            return;
+        };
+        if (sound.playback_speed - speed).abs() < f32::EPSILON {
+            return;
+        }
+        sound.playback_speed = speed;
+        self.audio.set_playback_speed(id, speed);
         cx.notify();
     }
 
@@ -1115,6 +1244,7 @@ impl SoundboardApp {
             return;
         };
         let volume = sound.volume;
+        let speed = sound.playback_speed;
         let duration = source.duration;
         let start = duration * self.trim_start_pct / 100.0;
         let end = duration * self.trim_end_pct / 100.0;
@@ -1125,7 +1255,7 @@ impl SoundboardApp {
         let preview_duration = end - start;
         let preview = source.trimmed(start, end);
         self.audio
-            .trigger(id, Arc::new(preview), volume, false, 0.0);
+            .trigger(id, Arc::new(preview), volume, false, 0.0, speed);
         self.selected_id = Some(id);
         self.paused = false;
         self.trim_preview_active = true;
@@ -1585,7 +1715,12 @@ impl SoundboardApp {
 
         let loop_allowed = self.looping && !self.trim_preview_active;
         if self.transport.is_some() && !self.paused && !loop_allowed {
-            self.playback_elapsed += delta;
+            let speed = self
+                .transport
+                .as_ref()
+                .map(|current| current.speed)
+                .unwrap_or(1.0);
+            self.playback_elapsed += delta * speed;
         } else if self.transport.is_none() || loop_allowed {
             self.playback_elapsed = 0.0;
         }
@@ -1778,10 +1913,11 @@ impl SoundboardApp {
 
         let start_ratio = start_ratio.clamp(0.0, 1.0);
         let duration = decoded.duration;
+        let speed = sound.playback_speed;
         self.selected_id = Some(id);
         self.trim_preview_active = false;
         self.audio
-            .trigger(id, decoded, sound.volume, self.looping, start_ratio);
+            .trigger(id, decoded, sound.volume, self.looping, start_ratio, speed);
         self.paused = false;
         self.playback_elapsed = 0.0;
         self.playback_generation = self.playback_generation.wrapping_add(1);
@@ -2340,6 +2476,7 @@ impl SoundboardApp {
             };
             self.sounds.push(sound);
             self.attach_volume_slider(id, 1.0, window, cx);
+            self.attach_speed_slider(id, 1.0, window, cx);
             if metadata_ok {
                 self.load_sound(id, path.clone(), true, window, cx);
             }
@@ -2402,6 +2539,8 @@ impl SoundboardApp {
             self.trim_preview_active = false;
         }
         self.sounds.remove(index);
+        self.volume_sliders.remove(&id);
+        self.speed_sliders.remove(&id);
         self.pending_trims.retain(|pending| *pending != id);
         let rename_open = self.rename_target == Some(id);
         let trim_open = self.trim_target == Some(id);
@@ -2478,6 +2617,7 @@ impl SoundboardApp {
                 .map(|sound| PersistedSound {
                     path: sound.path.to_string_lossy().to_string(),
                     volume: sound.volume,
+                    playback_speed: sound.playback_speed,
                     title: Some(sound.title.to_string()),
                     trim_start: Some(sound.trim_start),
                     trim_end: Some(sound.trim_end),
@@ -2732,9 +2872,9 @@ fn load_state() -> PersistedState {
 #[cfg(test)]
 mod tests {
     use super::{
-        LibraryMetrics, PageSize, auto_monitor_device, build_monitor_devices,
-        playback_watchdog_expired, state_path, waveform_bar_filled, waveform_ratio,
-        waveform_seek_ratio,
+        LibraryMetrics, PageSize, PersistedSound, PersistedState, ROUTING_PANEL_WIDTH_REM,
+        SIDEBAR_WIDTH_REM, auto_monitor_device, build_monitor_devices, playback_watchdog_expired,
+        state_path, waveform_bar_filled, waveform_ratio, waveform_seek_ratio,
     };
     use crate::audio::DeviceChoice;
     use gpui_kit::{Bounds, point, px, size};
@@ -2837,11 +2977,55 @@ mod tests {
     }
 
     #[test]
+    fn sparse_pages_grow_the_pads_to_fill_the_space() {
+        let metrics = LibraryMetrics::for_viewport(1280.0, 860.0, 15.0);
+        let base = metrics.tile_size_for_page(metrics.per_page, metrics.per_page);
+        assert!((base.width - metrics.tile_width).abs() < 0.001);
+        assert!((base.height - 12.0 * 15.0).abs() < 0.001);
+
+        // Four results no longer sit in a wide three-column row with a lonely
+        // pad underneath: they become a larger 2×2 block.
+        let four = metrics.tile_size_for_page(4, metrics.per_page);
+        assert!(four.width > base.width);
+        assert!(four.height > base.height);
+        assert!(four.width * 2.0 + metrics.gap <= metrics.usable_width + 0.001);
+
+        // A single result keeps the full width but is capped at twice the
+        // resting height instead of filling the whole window.
+        let one = metrics.tile_size_for_page(1, metrics.per_page);
+        assert!(one.width > four.width);
+        assert!((one.height - 24.0 * 15.0).abs() < 0.001);
+
+        // A full page keeps the standard layout.
+        let full = metrics.tile_size_for_page(metrics.per_page, metrics.per_page);
+        assert!((full.width - base.width).abs() < 0.001);
+        assert!((full.height - base.height).abs() < 0.001);
+    }
+
+    #[test]
+    fn sparse_page_pads_never_overflow_the_library_width() {
+        let metrics = LibraryMetrics::for_viewport(1280.0, 860.0, 15.0);
+        for visible in 1..metrics.per_page {
+            let size = metrics.tile_size_for_page(visible, metrics.per_page);
+            let columns = ((visible as f32).sqrt().ceil() as usize).clamp(1, metrics.columns);
+            let row_width =
+                columns as f32 * size.width + columns.saturating_sub(1) as f32 * metrics.gap;
+            assert!(
+                row_width <= metrics.usable_width + 0.001,
+                "{visible} pads: {row_width} > {}",
+                metrics.usable_width
+            );
+            assert!(size.height >= 12.0 * 15.0);
+            assert!(size.height <= 24.0 * 15.0 + 0.001);
+        }
+    }
+
+    #[test]
     fn auto_page_size_fills_the_library_with_whole_rows() {
         // Default 1280×860 window: three rows of three pads fit.
         assert_eq!(auto_page_size_for(1280.0, 860.0, 15.0), 9);
-        // Minimum 1120×760 window: only two rows fit.
-        assert_eq!(auto_page_size_for(1120.0, 760.0, 15.0), 6);
+        // Minimum 1120×760 window: two columns of two rows fit.
+        assert_eq!(auto_page_size_for(1120.0, 760.0, 15.0), 4);
         // A taller window gains a row.
         assert_eq!(auto_page_size_for(1280.0, 1080.0, 15.0), 12);
         // A wider window gains columns instead of stretching the pads.
@@ -2863,7 +3047,8 @@ mod tests {
         ] {
             let metrics = LibraryMetrics::for_viewport(width, height, 15.0);
             let rem = 15.0;
-            let content_width = width - 20.0 * rem - 2.5 * rem;
+            let content_width =
+                width - (SIDEBAR_WIDTH_REM + ROUTING_PANEL_WIDTH_REM) * rem - 2.5 * rem;
             let row_width = metrics.columns as f32 * metrics.tile_width
                 + (metrics.columns - 1) as f32 * 0.75 * rem;
             assert!(
@@ -2885,6 +3070,30 @@ mod tests {
         assert_eq!(PageSize::from_label("12"), Some(PageSize::Fixed(12)));
         assert_eq!(PageSize::from_label("7"), None);
         assert_eq!(PageSize::Fixed(24).index(), 6);
+    }
+
+    #[test]
+    fn pad_playback_speed_round_trips_through_saved_state() {
+        let state = PersistedState {
+            sounds: vec![PersistedSound {
+                path: "clip.mp3".into(),
+                volume: 1.0,
+                playback_speed: 1.25,
+                title: None,
+                trim_start: None,
+                trim_end: None,
+                shortcut: None,
+            }],
+            ..PersistedState::default()
+        };
+        let text = serde_json::to_string(&state).expect("serialize state");
+        let parsed: PersistedState = serde_json::from_str(&text).expect("parse state");
+        assert_eq!(parsed.sounds[0].playback_speed, 1.25);
+
+        // States written before the speed control existed keep normal speed.
+        let legacy: PersistedSound =
+            serde_json::from_str(r#"{"path":"clip.mp3"}"#).expect("parse legacy sound");
+        assert_eq!(legacy.playback_speed, 1.0);
     }
 
     #[test]
