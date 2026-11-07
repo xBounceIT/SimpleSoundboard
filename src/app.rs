@@ -1,9 +1,11 @@
 mod view;
 
 use std::{
+    cell::Cell,
     collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -136,6 +138,8 @@ fn default_playback_speed() -> f32 {
 enum TrimDrag {
     Start,
     End,
+    /// Dragging the amber playback cursor.
+    Cursor,
     Window { grab: f32 },
 }
 
@@ -445,6 +449,11 @@ pub struct SoundboardApp {
     seek_slider: Entity<SliderState>,
     volume_sliders: HashMap<SoundId, Entity<SliderState>>,
     speed_sliders: HashMap<SoundId, Entity<SliderState>>,
+    volume_target: Option<SoundId>,
+    volume_input: Entity<InputState>,
+    /// Bounds of the pad hosting the inline volume editor, reported by the
+    /// tile so a click anywhere else can dismiss the editor.
+    volume_edit_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 
     rename_target: Option<SoundId>,
     rename_input: Entity<InputState>,
@@ -452,6 +461,17 @@ pub struct SoundboardApp {
     trim_start_pct: f32,
     trim_end_pct: f32,
     trim_drag: Option<TrimDrag>,
+    /// Absolute playback cursor position in the trim view, 0..100 of the
+    /// full clip. Draggable on the waveform; audio can be started from it.
+    trim_cursor_pct: f32,
+    /// Video-editor style magnetism: when locked, dragging a trim handle
+    /// near the cursor snaps it onto the cursor position.
+    trim_cursor_lock: bool,
+    /// Absolute seconds into the full clip where the current trim preview started.
+    trim_preview_offset: f32,
+    /// Where the cursor was when the current preview was launched. Stopping
+    /// the playback returns the cursor to this point.
+    trim_preview_origin: f32,
     trim_preview_active: bool,
     pending_trims: VecDeque<SoundId>,
     search_input: Entity<InputState>,
@@ -640,6 +660,7 @@ impl SoundboardApp {
                 .default_value(0.0)
         });
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Pad name"));
+        let volume_input = cx.new(|cx| InputState::new(window, cx).placeholder("Volume %"));
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search by title"));
 
         let mut sounds = Vec::new();
@@ -737,10 +758,17 @@ impl SoundboardApp {
             speed_sliders: HashMap::new(),
             rename_target: None,
             rename_input,
+            volume_target: None,
+            volume_input,
+            volume_edit_bounds: Rc::new(Cell::new(None)),
             trim_target: None,
             trim_start_pct: 0.0,
             trim_end_pct: 100.0,
             trim_drag: None,
+            trim_cursor_pct: 0.0,
+            trim_cursor_lock: true,
+            trim_preview_offset: 0.0,
+            trim_preview_origin: 0.0,
             trim_preview_active: false,
             pending_trims: VecDeque::new(),
             search_input,
@@ -872,6 +900,20 @@ impl SoundboardApp {
                         }
                     ) {
                         this.commit_rename(window, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &app.volume_input,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    match event {
+                        InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false,
+                        } => this.commit_volume_edit(window, cx),
+                        InputEvent::Blur => this.blur_volume_edit(window, cx),
+                        _ => {}
                     }
                 },
             ),
@@ -1143,6 +1185,9 @@ impl SoundboardApp {
         self.trim_start_pct = start;
         self.trim_end_pct = end;
         self.trim_drag = None;
+        self.trim_cursor_pct = start;
+        self.trim_preview_origin = start;
+        self.trim_preview_offset = 0.0;
         cx.notify();
     }
 
@@ -1168,37 +1213,57 @@ impl SoundboardApp {
         (0.05 / duration * 100.0).clamp(0.05, 99.0)
     }
 
+    fn snap_to_cursor(&self, pointer: f32, snap_pct: f32) -> f32 {
+        if self.trim_cursor_lock && (pointer - self.trim_cursor_pct).abs() <= snap_pct {
+            self.trim_cursor_pct
+        } else {
+            pointer
+        }
+    }
+
     fn begin_trim_drag(
         &mut self,
         kind: TrimDrag,
         pointer: f32,
+        snap_pct: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.trim_target.is_none() {
             return;
         }
+        // Grabbing the cursor mid-preview stops the audio but keeps the
+        // cursor under the pointer instead of snapping it back to where the
+        // preview was launched.
+        let keep_cursor = matches!(kind, TrimDrag::Cursor) && self.trim_preview_active;
+        let cursor_now = self.trim_cursor_pct;
         if self.trim_preview_active {
             self.stop_playback(window, cx);
+        }
+        if keep_cursor {
+            self.trim_cursor_pct = cursor_now;
         }
         let pointer = pointer.clamp(0.0, 100.0);
         let min_gap = self.trim_min_gap_pct();
         match kind {
             TrimDrag::Start => {
+                let pointer = self.snap_to_cursor(pointer, snap_pct);
                 let max_start = (self.trim_end_pct - min_gap).max(0.0);
                 self.trim_start_pct = pointer.clamp(0.0, max_start);
             }
             TrimDrag::End => {
+                let pointer = self.snap_to_cursor(pointer, snap_pct);
                 let min_end = (self.trim_start_pct + min_gap).min(100.0);
                 self.trim_end_pct = pointer.clamp(min_end, 100.0);
             }
             TrimDrag::Window { .. } => {}
+            TrimDrag::Cursor => {}
         }
         self.trim_drag = Some(kind);
         cx.notify();
     }
 
-    fn update_trim_drag(&mut self, pointer: f32, cx: &mut Context<Self>) {
+    fn update_trim_drag(&mut self, pointer: f32, snap_pct: f32, cx: &mut Context<Self>) {
         let Some(kind) = self.trim_drag else {
             return;
         };
@@ -1206,12 +1271,17 @@ impl SoundboardApp {
         let min_gap = self.trim_min_gap_pct();
         match kind {
             TrimDrag::Start => {
+                let pointer = self.snap_to_cursor(pointer, snap_pct);
                 let max_start = (self.trim_end_pct - min_gap).max(0.0);
                 self.trim_start_pct = pointer.clamp(0.0, max_start);
             }
             TrimDrag::End => {
+                let pointer = self.snap_to_cursor(pointer, snap_pct);
                 let min_end = (self.trim_start_pct + min_gap).min(100.0);
                 self.trim_end_pct = pointer.clamp(min_end, 100.0);
+            }
+            TrimDrag::Cursor => {
+                self.trim_cursor_pct = pointer;
             }
             TrimDrag::Window { grab } => {
                 let span = (self.trim_end_pct - self.trim_start_pct).max(min_gap);
@@ -1229,6 +1299,9 @@ impl SoundboardApp {
         }
     }
 
+    /// The single play button always auditions from the amber cursor: into
+    /// the selected portion when the cursor is inside or before it, or to
+    /// the end of the file otherwise.
     fn toggle_trim_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.trim_preview_active {
             self.stop_playback(window, cx);
@@ -1246,19 +1319,53 @@ impl SoundboardApp {
         let volume = sound.volume;
         let speed = sound.playback_speed;
         let duration = source.duration;
-        let start = duration * self.trim_start_pct / 100.0;
-        let end = duration * self.trim_end_pct / 100.0;
-        if end - start < 0.05 {
-            window.push_notification("The selected portion is too short to audition.", cx);
+        let from = duration * self.trim_cursor_pct / 100.0;
+        let selection_end = duration * self.trim_end_pct / 100.0;
+        let to = if from < selection_end {
+            selection_end
+        } else {
+            duration
+        };
+        if to - from < 0.05 {
+            window.push_notification("Move the cursor earlier in the clip to play from it.", cx);
             return;
         }
-        let preview_duration = end - start;
-        let preview = source.trimmed(start, end);
+        self.launch_trim_preview(id, source, volume, speed, from, to - from, window, cx);
+    }
+
+    fn toggle_trim_cursor_lock(&mut self, cx: &mut Context<Self>) {
+        self.trim_cursor_lock = !self.trim_cursor_lock;
+        cx.notify();
+    }
+
+    /// The amber cursor doubles as the preview playhead. When playback
+    /// stops, the cursor returns to where the preview was launched.
+    fn end_trim_preview(&mut self) {
+        if self.trim_preview_active {
+            self.trim_cursor_pct = self.trim_preview_origin;
+        }
+        self.trim_preview_active = false;
+    }
+
+    fn launch_trim_preview(
+        &mut self,
+        id: SoundId,
+        source: Arc<audio::DecodedSound>,
+        volume: f32,
+        speed: f32,
+        from_seconds: f32,
+        preview_duration: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let preview = source.trimmed(from_seconds, from_seconds + preview_duration);
+        self.trim_preview_origin = self.trim_cursor_pct;
         self.audio
             .trigger(id, Arc::new(preview), volume, false, 0.0, speed);
         self.selected_id = Some(id);
         self.paused = false;
         self.trim_preview_active = true;
+        self.trim_preview_offset = from_seconds;
         self.playback_elapsed = 0.0;
         self.playback_generation = self.playback_generation.wrapping_add(1);
         let generation = self.playback_generation;
@@ -1303,7 +1410,7 @@ impl SoundboardApp {
         }
 
         self.audio.stop_sound(id);
-        self.trim_preview_active = false;
+        self.end_trim_preview();
         if self
             .transport
             .as_ref()
@@ -1374,6 +1481,107 @@ impl SoundboardApp {
         self.rename_target = None;
         window.focus(&self.focus_handle, cx);
         self.maybe_open_next_trim(window, cx);
+        cx.notify();
+    }
+
+    fn begin_volume_edit(&mut self, id: SoundId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sound) = self.sounds.iter().find(|sound| sound.id == id) else {
+            return;
+        };
+        let percent = format!("{}", (sound.volume * 100.0).round());
+        self.selected_id = Some(id);
+        self.volume_target = Some(id);
+        self.volume_input.update(cx, |input, cx| {
+            input.set_value(percent, window, cx);
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Parse the typed percentage and apply it. Returns false when the text
+    /// does not parse, leaving the caller to decide how to handle a bad value.
+    fn apply_volume_edit_text(&mut self, id: SoundId, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let raw = self
+            .volume_input
+            .read(cx)
+            .value()
+            .trim()
+            .trim_end_matches('%')
+            .trim()
+            .to_string();
+        let percent = match raw.parse::<f32>() {
+            Ok(value) if value.is_finite() => value,
+            _ => return false,
+        };
+        let volume = (percent / 100.0).clamp(0.0, MAX_SOUND_VOLUME);
+        self.apply_sound_volume_value(id, volume, cx);
+        // Keep the slider thumb in sync with the typed value.
+        if let Some(slider) = self.volume_sliders.get(&id) {
+            slider.update(cx, |slider, cx| {
+                slider.set_value(volume * 100.0, window, cx);
+            });
+        }
+        true
+    }
+
+    fn commit_volume_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.volume_target else {
+            return;
+        };
+        if !self.apply_volume_edit_text(id, window, cx) {
+            window.push_notification(
+                format!("Enter a percentage between 0 and {}.", (MAX_SOUND_VOLUME * 100.0) as u32),
+                cx,
+            );
+            return;
+        }
+        self.volume_target = None;
+        self.volume_edit_bounds.set(None);
+        self.save_state();
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Clicking anywhere that moves focus away (another pad, the library,
+    /// the footer…) closes the editor. Valid input is applied, invalid
+    /// input is discarded. The focus is left wherever the user clicked.
+    fn blur_volume_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.volume_target else {
+            return;
+        };
+        let applied = self.apply_volume_edit_text(id, window, cx);
+        if applied {
+            self.save_state();
+        }
+        self.volume_target = None;
+        self.volume_edit_bounds.set(None);
+        cx.notify();
+    }
+
+    /// Clicking anywhere outside the pad hosting the inline volume editor
+    /// dismisses it (a valid value is applied, an invalid one discarded).
+    fn close_volume_edit_outside(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.volume_target.is_none() {
+            return;
+        }
+        let Some(bounds) = self.volume_edit_bounds.get() else {
+            return;
+        };
+        let inside = position.x >= bounds.origin.x
+            && position.x < bounds.origin.x + bounds.size.width
+            && position.y >= bounds.origin.y
+            && position.y < bounds.origin.y + bounds.size.height;
+        if inside {
+            return;
+        }
+        self.blur_volume_edit(window, cx);
+    }
+
+    fn cancel_volume_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.volume_target = None;
+        self.volume_edit_bounds.set(None);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -1701,7 +1909,7 @@ impl SoundboardApp {
             self.seek_dragging = false;
             self.seek_preview = 0.0;
             if next_id.is_none() {
-                self.trim_preview_active = false;
+                self.end_trim_preview();
                 let seek = self.seek_slider.clone();
                 seek.update(cx, |slider, cx| slider.set_value(0.0, window, cx));
             } else if let Some(id) = next_id {
@@ -1736,8 +1944,9 @@ impl SoundboardApp {
             self.audio.stop_all();
             self.transport = None;
             self.paused = false;
-            self.trim_preview_active = false;
+            self.end_trim_preview();
             self.playback_elapsed = 0.0;
+            changed = true;
         }
 
         if (self.output_level_l - old_l).abs() > 0.001
@@ -1751,6 +1960,26 @@ impl SoundboardApp {
         }
 
         if let Some(current) = &self.transport {
+            if self.trim_preview_active {
+                // The amber cursor doubles as the preview playhead: it
+                // travels with the audio and returns to the launch position
+                // when the preview stops.
+                let full_duration = self
+                    .trim_target
+                    .and_then(|id| self.sounds.iter().find(|sound| sound.id == id))
+                    .map(Sound::full_duration)
+                    .unwrap_or(0.0);
+                if full_duration > 0.0 {
+                    let next = ((self.trim_preview_offset + current.position)
+                        / full_duration
+                        * 100.0)
+                        .clamp(0.0, 100.0);
+                    if (self.trim_cursor_pct - next).abs() > 0.01 {
+                        self.trim_cursor_pct = next;
+                        changed = true;
+                    }
+                }
+            }
             if !self.seek_dragging {
                 let ratio = if current.duration > 0.0 {
                     (current.position / current.duration).clamp(0.0, 1.0)
@@ -1913,11 +2142,12 @@ impl SoundboardApp {
 
         let start_ratio = start_ratio.clamp(0.0, 1.0);
         let duration = decoded.duration;
+        let volume = sound.volume;
         let speed = sound.playback_speed;
         self.selected_id = Some(id);
-        self.trim_preview_active = false;
+        self.end_trim_preview();
         self.audio
-            .trigger(id, decoded, sound.volume, self.looping, start_ratio, speed);
+            .trigger(id, decoded, volume, self.looping, start_ratio, speed);
         self.paused = false;
         self.playback_elapsed = 0.0;
         self.playback_generation = self.playback_generation.wrapping_add(1);
@@ -2091,7 +2321,7 @@ impl SoundboardApp {
     fn stop_playback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.audio.stop_all();
         self.playback_generation = self.playback_generation.wrapping_add(1);
-        self.trim_preview_active = false;
+        self.end_trim_preview();
         self.paused = false;
         self.transport = None;
         self.playback_elapsed = 0.0;
@@ -2119,7 +2349,7 @@ impl SoundboardApp {
             self.play_sound(id, window, cx);
         } else {
             self.audio.stop_all();
-            self.trim_preview_active = false;
+            self.end_trim_preview();
             self.transport = None;
             self.paused = false;
             self.seek_dragging = false;
@@ -2536,7 +2766,7 @@ impl SoundboardApp {
         };
         self.audio.stop_sound(id);
         if self.trim_target == Some(id) {
-            self.trim_preview_active = false;
+            self.end_trim_preview();
         }
         self.sounds.remove(index);
         self.volume_sliders.remove(&id);
@@ -2723,6 +2953,10 @@ impl SoundboardApp {
         }
         if self.rename_target.is_some() {
             self.cancel_rename(window, cx);
+            return;
+        }
+        if self.volume_target.is_some() {
+            self.cancel_volume_edit(window, cx);
             return;
         }
         if self.trim_target.is_some() {

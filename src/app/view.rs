@@ -13,6 +13,7 @@ use gpui_kit::component::{
     select::Select,
     slider::Slider,
     switch::Switch,
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::{
@@ -98,6 +99,12 @@ impl Render for SoundboardApp {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.add_paths(paths.0.to_vec(), window, cx);
             }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.close_volume_edit_outside(event.position, window, cx);
+                }),
+            )
             .child(self.render_title_bar(window, cx))
             .child(body)
             .child(self.render_transport(cx))
@@ -730,20 +737,12 @@ impl SoundboardApp {
         let end_fraction = self.trim_end_pct / 100.0;
         let dragging = self.trim_drag.is_some();
         let preview_active = self.trim_preview_active;
-        let preview_ratio = if preview_active {
-            self.transport
-                .as_ref()
-                .filter(|current| current.sound_id == id)
-                .map(|current| {
-                    if current.duration > 0.0 {
-                        (current.position / current.duration).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    }
-                })
-        } else {
-            None
-        };
+        let cursor_fraction = self.trim_cursor_pct / 100.0;
+        let cursor_seconds = duration * cursor_fraction;
+        let cursor_lock = self.trim_cursor_lock;
+        let cursor_differs = (self.trim_cursor_pct - self.trim_start_pct).abs() > 0.05;
+        let cursor_dragging = matches!(self.trim_drag, Some(TrimDrag::Cursor));
+        let show_cursor = cursor_differs || preview_active || cursor_dragging;
         let app = cx.entity().downgrade();
         let bounds_store: Rc<Cell<Option<Bounds<gpui_kit::Pixels>>>> = Rc::new(Cell::new(None));
 
@@ -773,7 +772,18 @@ impl SoundboardApp {
                     let start_x = usable * this.trim_start_pct / 100.0;
                     let end_x = usable * this.trim_end_pct / 100.0;
                     let tolerance = 14.0;
-                    let kind = if (x - start_x).abs() <= tolerance {
+                    let snap_pct = 12.0 / usable * 100.0;
+                    // The cursor's knob sits in a dedicated top strip: a click in
+                    // it always grabs the cursor, even where a handle lies below.
+                    let knob_zone = f32::from(event.position.y) - f32::from(bounds.origin.y) <= 18.0;
+                    let cursor_x = usable * this.trim_cursor_pct / 100.0;
+                    let cursor_dist = (x - cursor_x).abs();
+                    let handle_dist = (x - start_x).abs().min((x - end_x).abs());
+                    let kind = if cursor_dist <= tolerance
+                        && (cursor_dist < handle_dist || knob_zone)
+                    {
+                        TrimDrag::Cursor
+                    } else if (x - start_x).abs() <= tolerance {
                         TrimDrag::Start
                     } else if (x - end_x).abs() <= tolerance {
                         TrimDrag::End
@@ -786,7 +796,7 @@ impl SoundboardApp {
                     } else {
                         TrimDrag::End
                     };
-                    this.begin_trim_drag(kind, pointer_pct, window, cx);
+                    this.begin_trim_drag(kind, pointer_pct, snap_pct, window, cx);
                 })
             })
             .on_mouse_up(
@@ -848,35 +858,6 @@ impl SoundboardApp {
                             window.paint_path(path, p.blue);
                         }
 
-                        if let Some(ratio) = preview_ratio {
-                            let x = origin_x
-                                + inset
-                                + usable
-                                    * (start_fraction + (end_fraction - start_fraction) * ratio);
-                            window.paint_quad(quad(
-                                Bounds {
-                                    origin: point(px(x - 1.0), px(origin_y + 3.0)),
-                                    size: size(px(2.0), px((height - 6.0).max(1.0))),
-                                },
-                                px(0.0),
-                                p.signal,
-                                px(0.0),
-                                transparent_black(),
-                                Default::default(),
-                            ));
-                            window.paint_quad(quad(
-                                Bounds {
-                                    origin: point(px(x - 4.0), px(origin_y + 3.0)),
-                                    size: size(px(8.0), px(8.0)),
-                                },
-                                px(4.0),
-                                p.signal,
-                                px(0.0),
-                                transparent_black(),
-                                Default::default(),
-                            ));
-                        }
-
                         for boundary in [start_fraction, end_fraction] {
                             let x = origin_x + inset + usable * boundary;
                             window.paint_quad(quad(
@@ -917,6 +898,31 @@ impl SoundboardApp {
                             }
                         }
 
+                        // Amber scrub cursor, painted last so it stays on top.
+                        let cursor_x = origin_x + inset + usable * cursor_fraction;
+                        window.paint_quad(quad(
+                            Bounds {
+                                origin: point(px(cursor_x - 1.0), px(origin_y + 2.0)),
+                                size: size(px(2.0), px((height - 4.0).max(1.0))),
+                            },
+                            px(0.0),
+                            p.amber,
+                            px(0.0),
+                            transparent_black(),
+                            Default::default(),
+                        ));
+                        window.paint_quad(quad(
+                            Bounds {
+                                origin: point(px(cursor_x - 5.0), px(origin_y + 2.0)),
+                                size: size(px(10.0), px(10.0)),
+                            },
+                            px(5.0),
+                            p.amber,
+                            px(1.5),
+                            p.console,
+                            Default::default(),
+                        ));
+
                         if dragging {
                             let app_move = app.clone();
                             let app_up = app.clone();
@@ -931,8 +937,9 @@ impl SoundboardApp {
                                         - inset)
                                         .clamp(0.0, usable);
                                     let pointer_pct = x / usable * 100.0;
+                                    let snap_pct = 12.0 / usable * 100.0;
                                     let _ = app_move.update(cx, |this, cx| {
-                                        this.update_trim_drag(pointer_pct, cx);
+                                        this.update_trim_drag(pointer_pct, snap_pct, cx);
                                     });
                                 }
                             });
@@ -1008,9 +1015,9 @@ impl SoundboardApp {
                                             .small()
                                             .ghost()
                                             .tooltip(if preview_active {
-                                                "Stop the trim preview"
+                                                "Stop the audition"
                                             } else {
-                                                "Audition the selected portion"
+                                                "Play from the cursor to the end of the selection"
                                             })
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.toggle_trim_preview(window, cx);
@@ -1044,17 +1051,37 @@ impl SoundboardApp {
                                     .font_family(MONO_FONT)
                                     .text_xs()
                                     .text_color(p.ink_muted)
-                                    .child("DRAG THE HANDLES · DRAG THE CENTER TO MOVE"),
+                                    .child("DRAG THE CURSOR · DRAG THE HANDLES · DRAG INSIDE TO MOVE"),
                             )
+                            .when(show_cursor, |this| {
+                                this.child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_xs()
+                                        .text_color(p.amber)
+                                        .child(format!("CURSOR {}", format_time_precise(cursor_seconds))),
+                                )
+                            })
                             .child(
-                                div()
-                                    .font_family(MONO_FONT)
-                                    .text_xs()
-                                    .text_color(p.blue)
-                                    .child(format!(
-                                        "KEPT {}",
-                                        format_time_precise(selected_duration)
-                                    )),
+                                Button::new("trim-cursor-lock")
+                                    .small()
+                                    .ghost()
+                                    .icon(Icon::new(AppIcon::Magnet).size_3p5().text_color(
+                                        if cursor_lock { p.amber } else { p.ink_muted },
+                                    ))
+                                    .tooltip(if cursor_lock {
+                                        "Cursor snap is locked — the trim handles snap onto the cursor"
+                                    } else {
+                                        "Cursor snap is unlocked — the trim handles drag freely"
+                                    })
+                                    .accessibility_label(if cursor_lock {
+                                        "Unlock cursor snap"
+                                    } else {
+                                        "Lock cursor snap"
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_trim_cursor_lock(cx);
+                                    })),
                             ),
                     ),
             )
@@ -1427,7 +1454,12 @@ impl SoundboardApp {
             .flex_col()
             .gap_2()
             .child(
+                // Fixed height: the drag handle in the top-right corner is
+                // positioned absolutely, so both are anchored to the same
+                // 28px band (content `p_4` + this row) to stay vertically
+                // centered together.
                 h_flex()
+                    .h_7()
                     .flex_shrink_0()
                     .justify_between()
                     .items_center()
@@ -1630,13 +1662,40 @@ impl SoundboardApp {
                                     },
                                 ),
                             )
-                            .child(
+                            .child(if self.volume_target == Some(id) {
+                                // Clicked: the percentage becomes a text
+                                // input. Enter commits, Escape cancels.
                                 div()
+                                    .w_16()
+                                    .flex_shrink_0()
+                                    .child(
+                                        Input::new(&self.volume_input)
+                                            .w_full()
+                                            .font_family(MONO_FONT)
+                                            .text_xs(),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .id(("pad-volume-value", id))
+                                    .flex_shrink_0()
+                                    .cursor_pointer()
+                                    .rounded(cx.theme().radius)
                                     .font_family(MONO_FONT)
                                     .text_xs()
                                     .text_color(if boosted { p.amber } else { p.cream_muted })
-                                    .child(format_percent(sound.volume)),
-                            ),
+                                    .hover(|this| {
+                                        this.bg(p.cream.opacity(0.06)).text_color(p.cream)
+                                    })
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new("Click to type a value").build(window, cx)
+                                    })
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                        this.begin_volume_edit(id, window, cx);
+                                    }))
+                                    .child(format_percent(sound.volume))
+                                    .into_any_element()
+                            }),
                     )
                     .child(speed_control)
                     .child(if renaming {
@@ -1747,14 +1806,16 @@ impl SoundboardApp {
 
         // A dedicated 9x9 handle owns the top-right corner: it is the only
         // spot that shows the hand cursor, so a plain hover still reads as a
-        // playable pad.
+        // playable pad. `top_3` centers it on the header row (content `p_4`
+        // padding + the row's fixed `h_7`), keeping number, format, duration
+        // and this handle on the same line.
         let drag_handle = if renaming {
             div().into_any_element()
         } else {
             div()
                 .id(("sound-drag", id))
                 .absolute()
-                .top_1()
+                .top_3()
                 .right_1()
                 .size_9()
                 .rounded(cx.theme().radius)
@@ -1798,8 +1859,24 @@ impl SoundboardApp {
             })
             .child(content)
             .child(interaction_layer)
-            .child(drag_handle)
-            .into_any_element();
+            .child(drag_handle);
+
+        // Only the tile hosting the inline volume editor reports its bounds,
+        // so a click anywhere else can dismiss the editor.
+        let tile_body = if self.volume_target == Some(id) {
+            tile_body.child(
+                canvas(|bounds, _, _| bounds, {
+                    let bounds_store = self.volume_edit_bounds.clone();
+                    move |bounds, _, _, _| {
+                        bounds_store.set(Some(bounds));
+                    }
+                })
+                .absolute()
+                .inset_0(),
+            )
+        } else {
+            tile_body
+        };
 
         let rename_disabled = self.trim_target.is_some();
         let trim_disabled = loading || failed || self.rename_target.is_some();
