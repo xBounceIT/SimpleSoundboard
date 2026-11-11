@@ -183,8 +183,16 @@ pub struct Sound {
 }
 
 impl Sound {
+    #[cfg(test)]
     pub fn new(path: PathBuf, volume: f32) -> Self {
-        let id = sound_id(&path);
+        Self::with_id(sound_id(&path), path, volume)
+    }
+
+    /// Build a pad with an explicit identity.
+    ///
+    /// The bank keys every pad by `id`, so two pads can share the same file
+    /// and still be trimmed and played independently.
+    pub fn with_id(id: SoundId, path: PathBuf, volume: f32) -> Self {
         let title = title_from_path(&path);
         Self {
             id,

@@ -8,7 +8,7 @@ A desktop audio console for routing clips and voice into a virtual microphone, b
 
 - Imports **MP3, WAV, OGG and FLAC** files from the native picker, by dropping them onto the window, or with `Ctrl+O`.
 - After import it opens the trim editor automatically, so you can keep only a portion of the clip. **Audition** plays the selection with a playhead showing the current position.
-- Every clip becomes a pad in the bank. **Grab the grid handle** to change the order; right-click for Rename, Trim or Delete. Rename turns the pad title itself into an editable field.
+- Every clip becomes a pad in the bank. Importing the same file again creates another pad, so one audio file can keep different trims, volumes and speeds. **Grab the grid handle** to change the order; right-click for Rename, Trim or Delete. Rename turns the pad title itself into an editable field.
 - **Click a point on a pad's waveform** to jump straight to it: the clip on air seeks there, and any other pad starts from that point. Clicks elsewhere on the pad still play or stop it. Hovering a waveform previews the jump first — the band grows, the bars light up to the pointer and the pad shows the time under the cursor.
 - **Search by title** and page through the bank. The footer sets how many pads appear per page — **Auto** fills the window with whole rows — and the search filters as you type, resetting to the first page.
 - Assign each pad a **keyboard shortcut**: right-click the pad, choose Set shortcut, then press a Ctrl/Alt combination or an F-key. Shortcuts are checked for conflicts and saved with the bank.
@@ -43,6 +43,8 @@ The signal stays on the computer: no file is uploaded to a cloud service.
 ## Trimming and renaming
 
 When you import a file, the trim editor opens as soon as decoding is ready. The waveform becomes a single interactive surface: the selected portion is highlighted in blue, the rest is dimmed. Drag the two handles to set the start and end, or drag the center of the selection to move it. Press **Audition** to hear the selection: a colored playhead moves across the waveform from the chosen start to the chosen end. Press **Apply** to keep only that portion or **Cancel** to leave the clip intact.
+
+Clips longer than a minute open the editor zoomed in: onto the valid portion when the pad already has a trim, or onto the first minute of an untouched clip. That keeps the cursor and handles precise instead of compressing minutes into a few pixels. Click anywhere on the waveform to place the cursor there, drag the handles or the selection to edit the trim, and middle-drag or scroll to pan. Use `Ctrl+scroll` or the zoom buttons to zoom, and the fit buttons to show the whole clip or return to the valid portion.
 
 To manage an existing clip, right-click its pad: the context menu offers **Rename**, **Trim** and **Delete**. **Rename** turns the pad title directly into an editable field: **Enter** or the check mark saves, **Esc** or the X cancels. Trimming is applied to the playing sound, its duration and the displayed waveform. Names, order and trims are saved in local state.
 
@@ -142,7 +144,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-The 44 tests cover WAV and MP3 decoding, mixing, pause, loop, end of voice (including WAV files at a different sample rate), trigger exclusivity and polyphonic stacking, independent per-pad playback speeds, audio trimming, the monitor buffer, headphones-only routing, the library layout, release-note parsing, device preferences, virtual device detection, version comparison, setup asset selection and keyboard shortcut validation.
+The 52 tests cover WAV and MP3 decoding, mixing, pause, loop, end of voice (including WAV files at a different sample rate), trigger exclusivity and polyphonic stacking, independent per-pad playback speeds, audio trimming, duplicate imports, trim-view zooming and panning, the decode cache, the monitor buffer, headphones-only routing, the library layout, release-note parsing, device preferences, virtual device detection, version comparison, setup asset selection and keyboard shortcut validation.
 
 Main structure:
 
@@ -165,10 +167,10 @@ Releases are automated: [`.github/workflows/release.yml`](.github/workflows/rele
 Before tagging, the `version` in `Cargo.toml` must match the tag: the workflow refuses to publish if they differ.
 
 ```powershell
-# Cargo.toml: version = "1.2.0"
+# Cargo.toml: version = "1.3.0"
 git add .
-git commit -m "Release v1.2.0"
-git tag v1.2.0
+git commit -m "Release v1.3.0"
+git tag v1.3.0
 git push origin main --tags
 ```
 
@@ -176,8 +178,8 @@ To build the setup locally, install [Inno Setup 6](https://jrsoftware.org/isinfo
 
 ```powershell
 cargo build --release
-& 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer\simple-soundboard.iss /DAppVersion=1.2.0
-# dist\SimpleSoundboard-Setup-1.2.0.exe
+& 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer\simple-soundboard.iss /DAppVersion=1.3.0
+# dist\SimpleSoundboard-Setup-1.3.0.exe
 ```
 
 ## Limitations

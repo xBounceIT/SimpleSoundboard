@@ -6,8 +6,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{Arc, Weak},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use gpui_kit::component::{
@@ -44,6 +44,21 @@ gpui_kit::actions!(
 
 const STATE_VERSION: u32 = 2;
 
+/// Clips longer than this open the trim editor zoomed in, so the cursor can
+/// land on a precise point instead of spanning minutes in a few pixels.
+const TRIM_AUTO_ZOOM_SECONDS: f32 = 60.0;
+
+/// Narrowest slice of the clip the trim waveform can show, in percent.
+const MIN_TRIM_VIEW_SPAN_PCT: f32 = 0.1;
+
+/// A zoom-out that lands within this distance of the whole clip snaps to
+/// it, so the minimum zoom always shows the full sound.
+const FULL_TRIM_VIEW_TOLERANCE_PCT: f32 = 0.25;
+
+/// Extra context kept around the valid portion when zooming onto it, as a
+/// fraction of the selection: enough room to grab and extend both handles.
+const TRIM_VIEW_PADDING_RATIO: f32 = 0.2;
+
 /// Page-size choices offered by the pagination footer, in sounds per page.
 pub(crate) const PAGE_SIZE_OPTIONS: [usize; 7] = [3, 6, 9, 12, 18, 24, 48];
 
@@ -68,11 +83,6 @@ pub(crate) const SIDEBAR_WIDTH_REM: f32 = 5.0;
 /// Width of the routing console on the right, in rem.
 pub(crate) const ROUTING_PANEL_WIDTH_REM: f32 = 20.0;
 
-/// Ceiling for a pad enlarged on a page that holds fewer sounds than its
-/// page-size slots. Twice the resting height is enough to use the free space
-/// without turning a single result into a full-screen tile.
-const MAX_GROWN_TILE_HEIGHT_REM: f32 = 24.0;
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PersistedState {
     #[serde(default)]
@@ -81,6 +91,10 @@ struct PersistedState {
     sounds: Vec<PersistedSound>,
     #[serde(default)]
     selected_path: Option<String>,
+    /// Identity of the selected pad. Added when a bank started allowing the
+    /// same file on more than one pad; older states only carry the path.
+    #[serde(default)]
+    selected_id: Option<SoundId>,
     #[serde(default)]
     master_volume: Option<f32>,
     #[serde(default)]
@@ -111,6 +125,10 @@ struct PersistedState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedSound {
     path: String,
+    /// Stable pad identity. Missing in states written before duplicate files
+    /// were allowed; those fall back to the path-derived identity.
+    #[serde(default)]
+    id: Option<SoundId>,
     #[serde(default = "default_volume")]
     volume: f32,
     /// Playback rate for this pad, from `0.25` to `2.0`.
@@ -140,7 +158,39 @@ enum TrimDrag {
     End,
     /// Dragging the amber playback cursor.
     Cursor,
-    Window { grab: f32 },
+    Window {
+        grab: f32,
+        /// Set while the press can still turn out to be a plain click. A click
+        /// inside the selection moves the cursor; dragging moves the window.
+        click_pct: Option<f32>,
+        /// Movement, in percent, needed before the press becomes a drag.
+        click_slop_pct: f32,
+    },
+}
+
+/// Identity of a file on disk for the decode cache. Metadata changes make a
+/// cached decode miss, so an edited file is always read again.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DecodeCacheKey {
+    path: PathBuf,
+    length: u64,
+    modified_secs: u64,
+    modified_nanos: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DecodeWaiter {
+    sound_id: SoundId,
+    trim_after_load: bool,
+}
+
+/// Middle-button pan in progress on the trim waveform. The press position and
+/// the visible slice at that moment keep the drag anchored under the pointer.
+#[derive(Clone, Copy, Debug)]
+struct TrimPan {
+    origin_x: f32,
+    view_start_pct: f32,
+    span_pct: f32,
 }
 
 /// The point of a pad waveform under the pointer, previewed before a click
@@ -240,21 +290,12 @@ fn page_size_labels() -> Vec<SharedString> {
 /// Pad geometry for the current window, shared by the page-size calculation
 /// and by the grid that renders the pads, so the two can never disagree.
 pub(crate) struct LibraryMetrics {
-    /// Pads per row.
-    columns: usize,
     /// Width of a single pad, in pixels.
     pub(crate) tile_width: f32,
     /// Sounds that fill the window with whole rows.
     per_page: usize,
-    /// Width available to a row, with the same slack the grid uses.
-    usable_width: f32,
-    /// Height available to every row on the page.
-    content_height: f32,
-    /// Gap between pads, in pixels.
-    gap: f32,
-    /// Standard pad height and the ceiling for a page that is not full.
+    /// Standard pad height.
     base_tile_height: f32,
-    max_tile_height: f32,
 }
 
 /// Size of the pads on one library page.
@@ -315,44 +356,22 @@ impl LibraryMetrics {
             (((content_height + gap) / (TILE_HEIGHT_REM * rem + gap)).floor() as usize).max(1);
 
         Self {
-            columns,
             tile_width,
             per_page: (columns * rows).clamp(1, MAX_AUTO_PAGE_SIZE),
-            usable_width,
-            content_height,
-            gap,
             base_tile_height: TILE_HEIGHT_REM * rem,
-            max_tile_height: MAX_GROWN_TILE_HEIGHT_REM * rem,
         }
     }
 
     /// Pad size for a page that actually shows `visible` sounds.
     ///
-    /// A full page keeps the standard grid. A shorter page (last page of the
-    /// bank, filtered results, or a large fixed per-page size) spreads the
-    /// same free width and height over the sounds it has, so the pads grow
-    /// instead of leaving the page half empty. The height stops at twice the
-    /// resting size to keep a lone result from becoming a full-screen tile.
-    pub(crate) fn tile_size_for_page(&self, visible: usize, per_page: usize) -> TileSize {
-        if visible == 0 || visible >= per_page.max(1) {
-            return TileSize {
-                width: self.tile_width,
-                height: self.base_tile_height,
-            };
+    /// Pads always keep the size Auto computes for the whole bank: a short
+    /// page simply leaves empty space instead of stretching one pad across
+    /// the library.
+    pub(crate) fn tile_size_for_page(&self, _visible: usize, _per_page: usize) -> TileSize {
+        TileSize {
+            width: self.tile_width,
+            height: self.base_tile_height,
         }
-
-        // Near-square counts look best with a square-ish layout: four pads
-        // become 2×2 instead of a wide row with one lonely pad underneath.
-        let columns = ((visible as f32).sqrt().ceil() as usize).clamp(1, self.columns);
-        let rows = visible.div_ceil(columns).max(1);
-        let width = ((self.usable_width - self.gap * columns.saturating_sub(1) as f32)
-            / columns as f32)
-            .max(1.0);
-        let height = ((self.content_height - self.gap * rows.saturating_sub(1) as f32)
-            / rows as f32)
-            .clamp(self.base_tile_height, self.max_tile_height);
-
-        TileSize { width, height }
     }
 }
 
@@ -405,6 +424,79 @@ fn waveform_bar_filled(index: usize, count: usize, ratio: f32) -> bool {
     ((index as f32 + 0.5) / count as f32) <= ratio
 }
 
+/// Visible slice for a valid portion, plus a little room around both handles.
+fn padded_trim_view(start_pct: f32, end_pct: f32) -> (f32, f32) {
+    let start_pct = start_pct.clamp(0.0, 100.0);
+    let end_pct = end_pct.clamp(start_pct, 100.0);
+    let padding = (end_pct - start_pct) * TRIM_VIEW_PADDING_RATIO;
+    let mut start = start_pct - padding;
+    let mut end = end_pct + padding;
+    let mut span = (end - start).min(100.0);
+    if span < MIN_TRIM_VIEW_SPAN_PCT {
+        // Tiny selections on very long clips still need a slice wide enough
+        // to separate the two handles.
+        let center = (start + end) * 0.5;
+        span = MIN_TRIM_VIEW_SPAN_PCT;
+        start = center - span * 0.5;
+        end = center + span * 0.5;
+    }
+    if start < 0.0 {
+        start = 0.0;
+        end = span;
+    }
+    if end > 100.0 {
+        end = 100.0;
+        start = 100.0 - span;
+    }
+    (start.max(0.0), end.min(100.0))
+}
+
+/// Where the trim waveform starts when a clip opens.
+///
+/// Short clips always fit whole. A long clip opens on its valid portion when
+/// it already has one; a long untouched clip opens on its first minute, which
+/// is enough precision to place the cursor and can be panned from there.
+fn initial_trim_view(duration: f32, start_pct: f32, end_pct: f32) -> (f32, f32) {
+    if !duration.is_finite() || duration <= TRIM_AUTO_ZOOM_SECONDS {
+        return (0.0, 100.0);
+    }
+    let selection = (end_pct - start_pct).clamp(0.0, 100.0);
+    if selection < 100.0 - MIN_TRIM_VIEW_SPAN_PCT {
+        return padded_trim_view(start_pct, end_pct);
+    }
+    let window = (TRIM_AUTO_ZOOM_SECONDS / duration * 100.0).clamp(MIN_TRIM_VIEW_SPAN_PCT, 100.0);
+    (0.0, window)
+}
+
+/// Position of an absolute percentage inside the visible trim slice.
+fn trim_pct_to_fraction(pct: f32, view_start_pct: f32, view_end_pct: f32) -> f32 {
+    let span = (view_end_pct - view_start_pct).max(MIN_TRIM_VIEW_SPAN_PCT);
+    ((pct - view_start_pct) / span).clamp(0.0, 1.0)
+}
+
+/// Absolute percentage of the clip under a position inside the visible slice.
+fn trim_fraction_to_pct(fraction: f32, view_start_pct: f32, view_end_pct: f32) -> f32 {
+    let span = (view_end_pct - view_start_pct).max(MIN_TRIM_VIEW_SPAN_PCT);
+    (view_start_pct + fraction.clamp(0.0, 1.0) * span).clamp(0.0, 100.0)
+}
+
+/// New span after zooming, snapping to the whole clip from a sliver away.
+fn snapped_zoom_span(span_pct: f32, factor: f32) -> f32 {
+    let new_span = (span_pct * factor).clamp(MIN_TRIM_VIEW_SPAN_PCT, 100.0);
+    if factor > 1.0 && new_span >= 100.0 - FULL_TRIM_VIEW_TOLERANCE_PCT {
+        100.0
+    } else {
+        new_span
+    }
+}
+
+/// New view start after a middle-button drag of `drag_pct` (positive is to the
+/// right), keeping the slice inside the clip.
+fn trim_view_start_after_pan(press_start_pct: f32, span_pct: f32, drag_pct: f32) -> f32 {
+    let span = span_pct.clamp(MIN_TRIM_VIEW_SPAN_PCT, 100.0);
+    (press_start_pct - drag_pct).clamp(0.0, (100.0 - span).max(0.0))
+}
+
 pub struct SoundboardApp {
     sounds: Vec<Sound>,
     selected_id: Option<SoundId>,
@@ -449,6 +541,9 @@ pub struct SoundboardApp {
     seek_slider: Entity<SliderState>,
     volume_sliders: HashMap<SoundId, Entity<SliderState>>,
     speed_sliders: HashMap<SoundId, Entity<SliderState>>,
+    /// Identical files decode once and share the result across pads.
+    decode_inflight: HashMap<DecodeCacheKey, Vec<DecodeWaiter>>,
+    decode_cache: HashMap<DecodeCacheKey, Weak<audio::DecodedSound>>,
     volume_target: Option<SoundId>,
     volume_input: Entity<InputState>,
     /// Bounds of the pad hosting the inline volume editor, reported by the
@@ -460,7 +555,12 @@ pub struct SoundboardApp {
     trim_target: Option<SoundId>,
     trim_start_pct: f32,
     trim_end_pct: f32,
+    /// Absolute portion of the clip visible in the trim waveform, 0..100.
+    /// Long clips zoom onto the valid portion so the cursor stays precise.
+    trim_view_start_pct: f32,
+    trim_view_end_pct: f32,
     trim_drag: Option<TrimDrag>,
+    trim_pan: Option<TrimPan>,
     /// Absolute playback cursor position in the trim view, 0..100 of the
     /// full clip. Draggable on the waveform; audio can be started from it.
     trim_cursor_pct: f32,
@@ -671,11 +771,12 @@ impl SoundboardApp {
                 continue;
             }
             let path = normalize_path(&path);
-            let id = sound_id(&path);
-            if !seen.insert(id) {
-                continue;
-            }
-            let mut sound = Sound::new(path, saved.volume);
+            let id = match saved.id.filter(|id| *id != 0) {
+                Some(id) if !seen.contains(&id) => id,
+                _ => fresh_sound_id(&path, |id| seen.contains(&id)),
+            };
+            seen.insert(id);
+            let mut sound = Sound::with_id(id, path, saved.volume);
             sound.playback_speed = normalize_playback_speed(saved.playback_speed);
             if let Some(title) = saved
                 .title
@@ -692,12 +793,24 @@ impl SoundboardApp {
         }
 
         let selected_id = persisted
-            .selected_path
-            .as_deref()
-            .map(PathBuf::from)
-            .map(|path| normalize_path(&path))
-            .map(|path| sound_id(&path))
+            .selected_id
             .filter(|id| sounds.iter().any(|sound| sound.id == *id))
+            .or_else(|| {
+                persisted
+                    .selected_path
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .map(|path| normalize_path(&path))
+                    .map(|path| sound_id(&path))
+                    .and_then(|id| {
+                        // Old states only stored the path. Pick the first pad
+                        // that uses it, which is the only one they could hold.
+                        sounds
+                            .iter()
+                            .find(|sound| sound.id == id)
+                            .map(|sound| sound.id)
+                    })
+            })
             .or_else(|| sounds.first().map(|sound| sound.id));
         let page_size = PageSize::from_saved(persisted.per_page);
         let page_size_select = cx.new(|cx| {
@@ -708,14 +821,10 @@ impl SoundboardApp {
                 cx,
             )
         });
-        let initial_per_page = match page_size {
-            PageSize::Auto => LibraryMetrics::for_window(window).per_page,
-            PageSize::Fixed(size) => size,
-        };
-        let initial_page = selected_id
-            .and_then(|id| sounds.iter().position(|sound| sound.id == id))
-            .map(|index| index / initial_per_page.max(1))
-            .unwrap_or(0);
+        // Start on the first page instead of the page holding the restored
+        // selection: that can be a sparse last page (one pad alone), while
+        // every other page shows a full row layout.
+        let initial_page = 0;
 
         let focus_handle = cx.focus_handle();
         let output_error = audio_error.clone();
@@ -756,6 +865,8 @@ impl SoundboardApp {
             seek_slider,
             volume_sliders: HashMap::new(),
             speed_sliders: HashMap::new(),
+            decode_inflight: HashMap::new(),
+            decode_cache: HashMap::new(),
             rename_target: None,
             rename_input,
             volume_target: None,
@@ -764,7 +875,10 @@ impl SoundboardApp {
             trim_target: None,
             trim_start_pct: 0.0,
             trim_end_pct: 100.0,
+            trim_view_start_pct: 0.0,
+            trim_view_end_pct: 100.0,
             trim_drag: None,
+            trim_pan: None,
             trim_cursor_pct: 0.0,
             trim_cursor_lock: true,
             trim_preview_offset: 0.0,
@@ -906,15 +1020,13 @@ impl SoundboardApp {
             cx.subscribe_in(
                 &app.volume_input,
                 window,
-                |this, _, event: &InputEvent, window, cx| {
-                    match event {
-                        InputEvent::PressEnter {
-                            secondary: false,
-                            shift: false,
-                        } => this.commit_volume_edit(window, cx),
-                        InputEvent::Blur => this.blur_volume_edit(window, cx),
-                        _ => {}
-                    }
+                |this, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter {
+                        secondary: false,
+                        shift: false,
+                    } => this.commit_volume_edit(window, cx),
+                    InputEvent::Blur => this.blur_volume_edit(window, cx),
+                    _ => {}
                 },
             ),
             cx.subscribe_in(
@@ -1026,26 +1138,108 @@ impl SoundboardApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let key = decode_cache_key(&path);
+
+        // A pad re-created on top of a previously decoded file can attach it
+        // without spending another pass through the decoder.
+        if let Some(source) = self.decode_cache.get(&key).and_then(Weak::upgrade) {
+            let Some(sound) = self.sounds.iter_mut().find(|sound| sound.id == id) else {
+                cx.notify();
+                return;
+            };
+            sound.set_source(source);
+            if trim_after_load {
+                self.pending_trims.push_back(id);
+            }
+            if self.selected_id.is_none() {
+                self.selected_id = Some(id);
+            }
+            self.maybe_open_next_trim(window, cx);
+            cx.notify();
+            return;
+        }
+
+        // Duplicate imports wait on the decode that is already running
+        // instead of decoding the same file once per pad.
+        if let Some(waiters) = self.decode_inflight.get_mut(&key) {
+            waiters.push(DecodeWaiter {
+                sound_id: id,
+                trim_after_load,
+            });
+            return;
+        }
+
+        self.decode_inflight.insert(
+            key.clone(),
+            vec![DecodeWaiter {
+                sound_id: id,
+                trim_after_load,
+            }],
+        );
+
+        let decode_key = key.clone();
         cx.spawn_in(window, async move |this, window| {
             let result = window
                 .background_spawn(async move { audio::decode_audio(&path) })
                 .await;
             let _ = this.update_in(window, |this, window, cx| {
-                let Some(sound) = this.sounds.iter_mut().find(|sound| sound.id == id) else {
-                    cx.notify();
-                    return;
-                };
+                let waiters = this.decode_inflight.remove(&decode_key).unwrap_or_else(|| {
+                    vec![DecodeWaiter {
+                        sound_id: id,
+                        trim_after_load,
+                    }]
+                });
                 match result {
                     Ok(decoded) => {
-                        sound.set_source(Arc::new(decoded));
-                        if trim_after_load {
-                            this.pending_trims.push_back(id);
+                        let source = Arc::new(decoded);
+                        this.decode_cache
+                            .insert(decode_key.clone(), Arc::downgrade(&source));
+                        if this.decode_cache.len() > 128 {
+                            this.decode_cache
+                                .retain(|_, cached| cached.upgrade().is_some());
+                        }
+                        if this.decode_cache.len() > 128 {
+                            let overflow = this.decode_cache.len() - 128;
+                            let drop_keys: Vec<_> =
+                                this.decode_cache.keys().take(overflow).cloned().collect();
+                            for key in drop_keys {
+                                this.decode_cache.remove(&key);
+                            }
+                        }
+                        for waiter in &waiters {
+                            let Some(sound) = this
+                                .sounds
+                                .iter_mut()
+                                .find(|sound| sound.id == waiter.sound_id)
+                            else {
+                                continue;
+                            };
+                            sound.set_source(Arc::clone(&source));
+                            if waiter.trim_after_load {
+                                this.pending_trims.push_back(waiter.sound_id);
+                            }
                         }
                     }
-                    Err(error) => sound.set_failed(error.to_string()),
+                    Err(error) => {
+                        let error = error.to_string();
+                        for waiter in &waiters {
+                            if let Some(sound) = this
+                                .sounds
+                                .iter_mut()
+                                .find(|sound| sound.id == waiter.sound_id)
+                            {
+                                sound.set_failed(error.clone());
+                            }
+                        }
+                    }
                 }
                 if this.selected_id.is_none() {
-                    this.selected_id = Some(id);
+                    this.selected_id = waiters.iter().find_map(|waiter| {
+                        this.sounds
+                            .iter()
+                            .any(|sound| sound.id == waiter.sound_id)
+                            .then_some(waiter.sound_id)
+                    });
                 }
                 this.maybe_open_next_trim(window, cx);
                 cx.notify();
@@ -1109,22 +1303,27 @@ impl SoundboardApp {
         }
         let slider = cx.new(|_| {
             SliderState::new()
-                .min(MIN_PLAYBACK_SPEED)
-                .max(MAX_PLAYBACK_SPEED)
-                .step(0.25)
-                .default_value(normalize_playback_speed(speed))
+                .min(0.0)
+                .max(SPEED_SLIDER_MAX)
+                .step(1.0)
+                .default_value(speed_slider_position(speed))
         });
         let subscription = cx.subscribe_in(
             &slider,
             window,
-            move |this, _, event: &SliderEvent, _window, cx| match event {
+            move |this, slider, event: &SliderEvent, window, cx| match event {
                 SliderEvent::Change(value) => {
-                    this.apply_sound_speed(id, value.start(), cx);
+                    let speed = speed_from_position(value.start());
+                    // The slider moves the thumb to the raw pointer position;
+                    // re-assert the detent for this speed so the thumb and
+                    // ring jump exactly between the offered speeds.
+                    slider.update(cx, |state, cx| {
+                        state.set_value(speed_slider_position(speed), window, cx)
+                    });
+                    this.apply_sound_speed(id, speed, cx);
                 }
                 SliderEvent::Release(value) => {
-                    this.apply_sound_speed(id, value.start(), cx);
-                    // Change fires for every drag step, so the release often
-                    // carries the value already applied: save it regardless.
+                    this.apply_sound_speed(id, speed_from_position(value.start()), cx);
                     this.save_state();
                 }
             },
@@ -1180,11 +1379,15 @@ impl SoundboardApp {
         let min_gap = (0.05 / duration * 100.0).clamp(0.05, 99.0);
         let start = (trim_start / duration * 100.0).clamp(0.0, 100.0 - min_gap);
         let end = (trim_end / duration * 100.0).clamp(start + min_gap, 100.0);
+        let (view_start, view_end) = initial_trim_view(duration, start, end);
         self.selected_id = Some(id);
         self.trim_target = Some(id);
         self.trim_start_pct = start;
         self.trim_end_pct = end;
+        self.trim_view_start_pct = view_start;
+        self.trim_view_end_pct = view_end;
         self.trim_drag = None;
+        self.trim_pan = None;
         self.trim_cursor_pct = start;
         self.trim_preview_origin = start;
         self.trim_preview_offset = 0.0;
@@ -1199,6 +1402,7 @@ impl SoundboardApp {
             return;
         }
         self.trim_drag = None;
+        self.trim_pan = None;
         self.maybe_open_next_trim(window, cx);
         cx.notify();
     }
@@ -1211,6 +1415,115 @@ impl SoundboardApp {
             .unwrap_or(1.0)
             .max(0.01);
         (0.05 / duration * 100.0).clamp(0.05, 99.0)
+    }
+
+    fn trim_view_span_pct(&self) -> f32 {
+        (self.trim_view_end_pct - self.trim_view_start_pct).max(MIN_TRIM_VIEW_SPAN_PCT)
+    }
+
+    /// Zoom the waveform around an absolute point of the clip.
+    fn zoom_trim_view(&mut self, anchor_pct: f32, factor: f32, cx: &mut Context<Self>) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        let span = self.trim_view_span_pct();
+        let anchor = ((anchor_pct - self.trim_view_start_pct) / span).clamp(0.0, 1.0);
+        let new_span = snapped_zoom_span(span, factor);
+        let (start, end) = if factor > 1.0 && new_span >= 100.0 - FULL_TRIM_VIEW_TOLERANCE_PCT {
+            // Snap to the whole clip once the missing piece is a sliver.
+            (0.0, 100.0)
+        } else {
+            let mut start = anchor_pct - new_span * anchor;
+            let mut end = start + new_span;
+            if start < 0.0 {
+                start = 0.0;
+                end = new_span;
+            }
+            if end > 100.0 {
+                end = 100.0;
+                start = (100.0 - new_span).max(0.0);
+            }
+            (start, end)
+        };
+        if (start - self.trim_view_start_pct).abs() < f32::EPSILON
+            && (end - self.trim_view_end_pct).abs() < f32::EPSILON
+        {
+            return;
+        }
+        self.trim_view_start_pct = start;
+        self.trim_view_end_pct = end;
+        cx.notify();
+    }
+
+    /// Slide the visible slice without changing its width.
+    fn pan_trim_view(&mut self, delta_pct: f32, cx: &mut Context<Self>) {
+        if !delta_pct.is_finite() || delta_pct == 0.0 {
+            return;
+        }
+        let span = self.trim_view_span_pct();
+        if span >= 100.0 - FULL_TRIM_VIEW_TOLERANCE_PCT {
+            if (self.trim_view_start_pct - 0.0).abs() >= f32::EPSILON
+                || (self.trim_view_end_pct - 100.0).abs() >= f32::EPSILON
+            {
+                self.trim_view_start_pct = 0.0;
+                self.trim_view_end_pct = 100.0;
+                cx.notify();
+            }
+            return;
+        }
+        let start = (self.trim_view_start_pct + delta_pct).clamp(0.0, 100.0 - span);
+        self.trim_view_start_pct = start;
+        self.trim_view_end_pct = start + span;
+        cx.notify();
+    }
+
+    /// Start a middle-button pan anchored at `origin_x`, relative to the
+    /// waveform's usable width.
+    fn begin_trim_pan(&mut self, origin_x: f32, cx: &mut Context<Self>) {
+        self.trim_pan = Some(TrimPan {
+            origin_x,
+            view_start_pct: self.trim_view_start_pct,
+            span_pct: self.trim_view_span_pct(),
+        });
+        cx.notify();
+    }
+
+    /// Continue a middle-button pan: dragging right reveals earlier audio, as
+    /// if the waveform were being pulled under the pointer.
+    fn update_trim_pan(&mut self, pointer_x: f32, usable_width: f32, cx: &mut Context<Self>) {
+        let Some(pan) = self.trim_pan else {
+            return;
+        };
+        let delta_pct = (pointer_x - pan.origin_x) / usable_width.max(1.0) * pan.span_pct;
+        let start = trim_view_start_after_pan(pan.view_start_pct, pan.span_pct, delta_pct);
+        if (start - self.trim_view_start_pct).abs() < f32::EPSILON {
+            return;
+        }
+        self.trim_view_start_pct = start;
+        self.trim_view_end_pct = start + pan.span_pct;
+        cx.notify();
+    }
+
+    fn end_trim_pan(&mut self, cx: &mut Context<Self>) {
+        if self.trim_pan.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Show the whole file again, so another portion can be picked.
+    fn fit_trim_view_to_clip(&mut self, cx: &mut Context<Self>) {
+        self.trim_view_start_pct = 0.0;
+        self.trim_view_end_pct = 100.0;
+        cx.notify();
+    }
+
+    /// Zoom onto the currently valid portion, with enough context around it
+    /// for both handles.
+    fn fit_trim_view_to_selection(&mut self, cx: &mut Context<Self>) {
+        let (start, end) = padded_trim_view(self.trim_start_pct, self.trim_end_pct);
+        self.trim_view_start_pct = start;
+        self.trim_view_end_pct = end;
+        cx.notify();
     }
 
     fn snap_to_cursor(&self, pointer: f32, snap_pct: f32) -> f32 {
@@ -1232,16 +1545,8 @@ impl SoundboardApp {
         if self.trim_target.is_none() {
             return;
         }
-        // Grabbing the cursor mid-preview stops the audio but keeps the
-        // cursor under the pointer instead of snapping it back to where the
-        // preview was launched.
-        let keep_cursor = matches!(kind, TrimDrag::Cursor) && self.trim_preview_active;
-        let cursor_now = self.trim_cursor_pct;
         if self.trim_preview_active {
             self.stop_playback(window, cx);
-        }
-        if keep_cursor {
-            self.trim_cursor_pct = cursor_now;
         }
         let pointer = pointer.clamp(0.0, 100.0);
         let min_gap = self.trim_min_gap_pct();
@@ -1257,7 +1562,11 @@ impl SoundboardApp {
                 self.trim_end_pct = pointer.clamp(min_end, 100.0);
             }
             TrimDrag::Window { .. } => {}
-            TrimDrag::Cursor => {}
+            TrimDrag::Cursor => {
+                // A plain click anywhere on the waveform places the cursor
+                // immediately, and dragging keeps scrubbing from there.
+                self.trim_cursor_pct = pointer;
+            }
         }
         self.trim_drag = Some(kind);
         cx.notify();
@@ -1283,7 +1592,23 @@ impl SoundboardApp {
             TrimDrag::Cursor => {
                 self.trim_cursor_pct = pointer;
             }
-            TrimDrag::Window { grab } => {
+            TrimDrag::Window {
+                grab,
+                click_pct,
+                click_slop_pct,
+            } => {
+                if let Some(press_pct) = click_pct {
+                    if (pointer - press_pct).abs() <= click_slop_pct {
+                        // Still a click, not a drag: keep the selection put
+                        // until the pointer clearly leaves the press point.
+                        return;
+                    }
+                    self.trim_drag = Some(TrimDrag::Window {
+                        grab,
+                        click_pct: None,
+                        click_slop_pct,
+                    });
+                }
                 let span = (self.trim_end_pct - self.trim_start_pct).max(min_gap);
                 let start = (pointer - grab).clamp(0.0, 100.0 - span);
                 self.trim_start_pct = start;
@@ -1294,9 +1619,19 @@ impl SoundboardApp {
     }
 
     fn end_trim_drag(&mut self, cx: &mut Context<Self>) {
-        if self.trim_drag.take().is_some() {
-            cx.notify();
+        let Some(kind) = self.trim_drag.take() else {
+            return;
+        };
+        // Releasing without dragging inside the selection is a click: put the
+        // amber cursor exactly where the pointer landed.
+        if let TrimDrag::Window {
+            click_pct: Some(pct),
+            ..
+        } = kind
+        {
+            self.trim_cursor_pct = pct.clamp(0.0, 100.0);
         }
+        cx.notify();
     }
 
     /// The single play button always auditions from the amber cursor: into
@@ -1426,6 +1761,7 @@ impl SoundboardApp {
         }
         self.trim_target = None;
         self.trim_drag = None;
+        self.trim_pan = None;
         self.save_state();
         self.maybe_open_next_trim(window, cx);
         window.push_notification("Trim applied.", cx);
@@ -1501,7 +1837,12 @@ impl SoundboardApp {
 
     /// Parse the typed percentage and apply it. Returns false when the text
     /// does not parse, leaving the caller to decide how to handle a bad value.
-    fn apply_volume_edit_text(&mut self, id: SoundId, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn apply_volume_edit_text(
+        &mut self,
+        id: SoundId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let raw = self
             .volume_input
             .read(cx)
@@ -1531,7 +1872,10 @@ impl SoundboardApp {
         };
         if !self.apply_volume_edit_text(id, window, cx) {
             window.push_notification(
-                format!("Enter a percentage between 0 and {}.", (MAX_SOUND_VOLUME * 100.0) as u32),
+                format!(
+                    "Enter a percentage between 0 and {}.",
+                    (MAX_SOUND_VOLUME * 100.0) as u32
+                ),
                 cx,
             );
             return;
@@ -1561,7 +1905,12 @@ impl SoundboardApp {
 
     /// Clicking anywhere outside the pad hosting the inline volume editor
     /// dismisses it (a valid value is applied, an invalid one discarded).
-    fn close_volume_edit_outside(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_volume_edit_outside(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.volume_target.is_none() {
             return;
         }
@@ -1970,8 +2319,7 @@ impl SoundboardApp {
                     .map(Sound::full_duration)
                     .unwrap_or(0.0);
                 if full_duration > 0.0 {
-                    let next = ((self.trim_preview_offset + current.position)
-                        / full_duration
+                    let next = ((self.trim_preview_offset + current.position) / full_duration
                         * 100.0)
                         .clamp(0.0, 100.0);
                     if (self.trim_cursor_pct - next).abs() > 0.01 {
@@ -2680,7 +3028,6 @@ impl SoundboardApp {
 
     fn add_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let mut added = 0usize;
-        let mut duplicates = 0usize;
         let mut unsupported = 0usize;
         let mut failed = 0usize;
 
@@ -2690,12 +3037,10 @@ impl SoundboardApp {
                 continue;
             }
             let path = normalize_path(&path);
-            let id = sound_id(&path);
-            if self.sounds.iter().any(|sound| sound.id == id) {
-                duplicates += 1;
-                continue;
-            }
-            let mut sound = Sound::new(path.clone(), 1.0);
+            // The same file may be imported again for another trim: every
+            // import becomes its own pad with its own identity.
+            let id = fresh_sound_id(&path, |id| self.sounds.iter().any(|sound| sound.id == id));
+            let mut sound = Sound::with_id(id, path.clone(), 1.0);
             let metadata_ok = match fs::metadata(&path) {
                 Ok(_) => true,
                 Err(error) => {
@@ -2716,7 +3061,7 @@ impl SoundboardApp {
             added += 1;
         }
 
-        if added == 0 && duplicates == 0 && unsupported == 0 {
+        if added == 0 && unsupported == 0 {
             return;
         }
 
@@ -2730,9 +3075,6 @@ impl SoundboardApp {
                     "sounds added"
                 }
             ));
-        }
-        if duplicates > 0 {
-            parts.push(format!("{duplicates} already in the bank"));
         }
         if unsupported > 0 {
             parts.push(format!(
@@ -2780,6 +3122,7 @@ impl SoundboardApp {
         if trim_open {
             self.trim_target = None;
             self.trim_drag = None;
+            self.trim_pan = None;
             self.seek_dragging = false;
         }
         if self.selected_id == Some(id) {
@@ -2846,6 +3189,7 @@ impl SoundboardApp {
                 .iter()
                 .map(|sound| PersistedSound {
                     path: sound.path.to_string_lossy().to_string(),
+                    id: Some(sound.id),
                     volume: sound.volume,
                     playback_speed: sound.playback_speed,
                     title: Some(sound.title.to_string()),
@@ -2857,6 +3201,7 @@ impl SoundboardApp {
             selected_path: self
                 .selected_sound()
                 .map(|sound| sound.path.to_string_lossy().to_string()),
+            selected_id: self.selected_id,
             master_volume: Some(self.master_volume),
             mic_monitor: Some(self.mic_monitor),
             mic_gain: Some(self.mic_gain),
@@ -3036,6 +3381,41 @@ fn auto_monitor_device(devices: &[DeviceChoice]) -> Option<String> {
         .map(|choice| choice.name.clone())
 }
 
+/// Grid the speed slider actually works on. The eight offered speeds are not
+/// evenly spaced around 1×, so the slider's own domain is a 0–48 integer
+/// grid whose detents land exactly on every offered speed, with 1× pinned to
+/// the middle (24). Speeds below 1× cover the left half of the track,
+/// speeds above it the right half, which is what puts 1× at a true center.
+const SPEED_SLIDER_MAX: f32 = 48.0;
+/// Detent of 1× on the grid: exactly halfway along the track.
+const SPEED_SLIDER_NORMAL: f32 = 24.0;
+
+/// Position of `speed` on the speed slider's track (0–[`SPEED_SLIDER_MAX`]).
+///
+/// The offered speeds are asymmetric around 1× (0.25–1.0 on the left half,
+/// 1.0–2.0 on the right half), so 1× sits exactly at the centre.
+fn speed_slider_position(speed: f32) -> f32 {
+    let speed = normalize_playback_speed(speed);
+    if speed <= 1.0 {
+        (speed - MIN_PLAYBACK_SPEED) / (1.0 - MIN_PLAYBACK_SPEED) * SPEED_SLIDER_NORMAL
+    } else {
+        SPEED_SLIDER_NORMAL
+            + (speed - 1.0) / (MAX_PLAYBACK_SPEED - 1.0) * (SPEED_SLIDER_MAX - SPEED_SLIDER_NORMAL)
+    }
+}
+
+/// Speed offered by a raw position on the speed slider's track.
+fn speed_from_position(position: f32) -> f32 {
+    let position = position.clamp(0.0, SPEED_SLIDER_MAX);
+    let speed = if position <= SPEED_SLIDER_NORMAL {
+        MIN_PLAYBACK_SPEED + position / SPEED_SLIDER_NORMAL * (1.0 - MIN_PLAYBACK_SPEED)
+    } else {
+        1.0 + (position - SPEED_SLIDER_NORMAL) / (SPEED_SLIDER_MAX - SPEED_SLIDER_NORMAL)
+            * (MAX_PLAYBACK_SPEED - 1.0)
+    };
+    normalize_playback_speed(speed)
+}
+
 fn monitor_device_labels(devices: &[DeviceChoice]) -> Vec<SharedString> {
     let mut labels = vec![SharedString::from("None")];
     labels.extend(
@@ -3051,6 +3431,56 @@ fn device_labels(devices: &[DeviceChoice]) -> Vec<SharedString> {
         .iter()
         .map(|device| SharedString::from(device.label()))
         .collect()
+}
+
+/// Give a pad its own identity even when the same file is already in the bank.
+///
+/// The path hash keeps identities stable across restarts for states that do
+/// not carry one; repeated files are mixed until they find a free slot.
+fn fresh_sound_id(path: &Path, used: impl Fn(SoundId) -> bool) -> SoundId {
+    let mut id = sound_id(path);
+    if id == 0 {
+        id = 1;
+    }
+    while used(id) {
+        id = mix_sound_id(id);
+        if id == 0 {
+            id = 1;
+        }
+    }
+    id
+}
+
+/// Stable key for the per-session decode cache. The modification time busts
+/// the cache when the file on disk changes under the same path.
+fn decode_cache_key(path: &Path) -> DecodeCacheKey {
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let (length, modified_secs, modified_nanos) = fs::metadata(&path)
+        .ok()
+        .map(|metadata| {
+            let (secs, nanos) = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|elapsed| (elapsed.as_secs(), u64::from(elapsed.subsec_nanos())))
+                .unwrap_or((0, 0));
+            (metadata.len(), secs, nanos)
+        })
+        .unwrap_or((0, 0, 0));
+    DecodeCacheKey {
+        path,
+        length,
+        modified_secs,
+        modified_nanos,
+    }
+}
+
+/// SplitMix64 finalizer: a cheap, well-spread step between id attempts.
+fn mix_sound_id(mut id: SoundId) -> SoundId {
+    id = id.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    id = (id ^ (id >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    id = (id ^ (id >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    id ^ (id >> 31)
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -3106,11 +3536,15 @@ fn load_state() -> PersistedState {
 #[cfg(test)]
 mod tests {
     use super::{
-        LibraryMetrics, PageSize, PersistedSound, PersistedState, ROUTING_PANEL_WIDTH_REM,
-        SIDEBAR_WIDTH_REM, auto_monitor_device, build_monitor_devices, playback_watchdog_expired,
-        state_path, waveform_bar_filled, waveform_ratio, waveform_seek_ratio,
+        LibraryMetrics, MAX_AUTO_COLUMNS, MIN_TILE_WIDTH_REM, PageSize, PersistedSound,
+        PersistedState, ROUTING_PANEL_WIDTH_REM, SIDEBAR_WIDTH_REM, auto_monitor_device,
+        build_monitor_devices, decode_cache_key, fresh_sound_id, initial_trim_view,
+        playback_watchdog_expired, snapped_zoom_span, speed_from_position, speed_slider_position,
+        state_path, trim_fraction_to_pct, trim_pct_to_fraction, trim_view_start_after_pan,
+        waveform_bar_filled, waveform_ratio, waveform_seek_ratio,
     };
     use crate::audio::DeviceChoice;
+    use crate::model::PLAYBACK_SPEEDS;
     use gpui_kit::{Bounds, point, px, size};
     use std::path::Path;
 
@@ -3211,46 +3645,23 @@ mod tests {
     }
 
     #[test]
-    fn sparse_pages_grow_the_pads_to_fill_the_space() {
+    fn pads_keep_the_standard_size_on_short_last_pages() {
         let metrics = LibraryMetrics::for_viewport(1280.0, 860.0, 15.0);
         let base = metrics.tile_size_for_page(metrics.per_page, metrics.per_page);
         assert!((base.width - metrics.tile_width).abs() < 0.001);
         assert!((base.height - 12.0 * 15.0).abs() < 0.001);
 
-        // Four results no longer sit in a wide three-column row with a lonely
-        // pad underneath: they become a larger 2×2 block.
-        let four = metrics.tile_size_for_page(4, metrics.per_page);
-        assert!(four.width > base.width);
-        assert!(four.height > base.height);
-        assert!(four.width * 2.0 + metrics.gap <= metrics.usable_width + 0.001);
-
-        // A single result keeps the full width but is capped at twice the
-        // resting height instead of filling the whole window.
+        // A last page with only one pad is laid out at the same size as the
+        // rest of the bank instead of being stretched to fill the screen.
         let one = metrics.tile_size_for_page(1, metrics.per_page);
-        assert!(one.width > four.width);
-        assert!((one.height - 24.0 * 15.0).abs() < 0.001);
+        assert!((one.width - base.width).abs() < 0.001);
+        assert!((one.height - base.height).abs() < 0.001);
 
-        // A full page keeps the standard layout.
-        let full = metrics.tile_size_for_page(metrics.per_page, metrics.per_page);
-        assert!((full.width - base.width).abs() < 0.001);
-        assert!((full.height - base.height).abs() < 0.001);
-    }
-
-    #[test]
-    fn sparse_page_pads_never_overflow_the_library_width() {
-        let metrics = LibraryMetrics::for_viewport(1280.0, 860.0, 15.0);
+        // The same holds for any partially filled page.
         for visible in 1..metrics.per_page {
             let size = metrics.tile_size_for_page(visible, metrics.per_page);
-            let columns = ((visible as f32).sqrt().ceil() as usize).clamp(1, metrics.columns);
-            let row_width =
-                columns as f32 * size.width + columns.saturating_sub(1) as f32 * metrics.gap;
-            assert!(
-                row_width <= metrics.usable_width + 0.001,
-                "{visible} pads: {row_width} > {}",
-                metrics.usable_width
-            );
-            assert!(size.height >= 12.0 * 15.0);
-            assert!(size.height <= 24.0 * 15.0 + 0.001);
+            assert_eq!(size.width, base.width);
+            assert_eq!(size.height, base.height);
         }
     }
 
@@ -3283,14 +3694,46 @@ mod tests {
             let rem = 15.0;
             let content_width =
                 width - (SIDEBAR_WIDTH_REM + ROUTING_PANEL_WIDTH_REM) * rem - 2.5 * rem;
-            let row_width = metrics.columns as f32 * metrics.tile_width
-                + (metrics.columns - 1) as f32 * 0.75 * rem;
+            let min_tile_width = MIN_TILE_WIDTH_REM * rem;
+            let gap = 0.75 * rem;
+            let columns = (((content_width + gap) / (min_tile_width + gap)).floor() as usize)
+                .clamp(1, MAX_AUTO_COLUMNS);
+            let row_width = columns as f32 * metrics.tile_width + (columns - 1) as f32 * 0.75 * rem;
             assert!(
                 row_width <= content_width,
                 "{width}×{height}: {row_width} > {content_width}"
             );
             assert!(metrics.tile_width >= 15.5 * rem);
         }
+    }
+
+    #[test]
+    fn speed_slider_centers_normal_speed() {
+        const EPS: f32 = 1e-3;
+        // 1× must sit exactly at the centre of the track and report back as 1×.
+        assert_eq!(speed_slider_position(1.0), 24.0);
+        assert_eq!(speed_from_position(24.0), 1.0);
+
+        // Every offered speed lands exactly on a detent, and reading back a
+        // detent returns the same speed.
+        let mut last = 0.0f32;
+        for speed in PLAYBACK_SPEEDS {
+            let position = speed_slider_position(speed);
+            assert!(
+                position >= last,
+                "detents are monotonic: {position} after {last}"
+            );
+            last = position;
+            assert!(
+                (speed_from_position(position) - speed).abs() < EPS,
+                "round trip of {speed} via {position}"
+            );
+        }
+        // The endpoints cover the whole track.
+        assert!(speed_slider_position(PLAYBACK_SPEEDS[0]).abs() < EPS);
+        assert!(
+            (speed_slider_position(PLAYBACK_SPEEDS[PLAYBACK_SPEEDS.len() - 1]) - 48.0).abs() < EPS
+        );
     }
 
     #[test]
@@ -3307,10 +3750,135 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_files_get_distinct_pad_ids() {
+        let path = Path::new("C:/sounds/clip.mp3");
+        let first = fresh_sound_id(path, |_| false);
+        let second = fresh_sound_id(path, |id| id == first);
+        let third = fresh_sound_id(path, |id| id == first || id == second);
+        assert_ne!(first, second);
+        assert_ne!(first, third);
+        assert_ne!(second, third);
+        assert_ne!(first, 0);
+    }
+
+    #[test]
+    fn duplicate_files_round_trip_through_saved_state() {
+        let state = PersistedState {
+            sounds: vec![
+                PersistedSound {
+                    path: "clip.mp3".into(),
+                    id: Some(11),
+                    volume: 1.0,
+                    playback_speed: 1.0,
+                    title: None,
+                    trim_start: Some(1.0),
+                    trim_end: Some(2.0),
+                    shortcut: None,
+                },
+                PersistedSound {
+                    path: "clip.mp3".into(),
+                    id: Some(12),
+                    volume: 1.0,
+                    playback_speed: 1.0,
+                    title: None,
+                    trim_start: Some(4.0),
+                    trim_end: Some(5.0),
+                    shortcut: None,
+                },
+            ],
+            selected_id: Some(12),
+            ..PersistedState::default()
+        };
+        let text = serde_json::to_string(&state).expect("serialize state");
+        let parsed: PersistedState = serde_json::from_str(&text).expect("parse state");
+        assert_eq!(parsed.sounds.len(), 2);
+        assert_eq!(parsed.sounds[0].id, Some(11));
+        assert_eq!(parsed.sounds[1].id, Some(12));
+        assert_eq!(parsed.selected_id, Some(12));
+
+        // A state written before pad identities existed still loads.
+        let legacy: PersistedSound =
+            serde_json::from_str(r#"{"path":"clip.mp3"}"#).expect("parse legacy sound");
+        assert_eq!(legacy.id, None);
+    }
+
+    #[test]
+    fn the_decode_cache_key_tracks_file_changes() {
+        let path = std::env::temp_dir().join("simple-soundboard-decode-cache-key.bin");
+        std::fs::write(&path, b"abc").expect("write cache probe");
+        let first = decode_cache_key(&path);
+        std::fs::write(&path, b"abcdef").expect("rewrite cache probe");
+        let second = decode_cache_key(&path);
+        assert_ne!(first, second);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn long_clips_open_the_trim_editor_zoomed_on_the_valid_portion() {
+        // Short clips still fit whole, including the 60-second boundary.
+        assert_eq!(initial_trim_view(30.0, 0.0, 100.0), (0.0, 100.0));
+        assert_eq!(initial_trim_view(60.0, 0.0, 100.0), (0.0, 100.0));
+
+        // A long untouched clip opens on its first minute.
+        let (start, end) = initial_trim_view(600.0, 0.0, 100.0);
+        assert_eq!(start, 0.0);
+        assert!((end - 10.0).abs() < 0.001);
+
+        // A long trimmed clip zooms onto the selection and keeps some context.
+        let (start, end) = initial_trim_view(600.0, 10.0, 12.0);
+        assert!(start < 10.0);
+        assert!(end > 12.0);
+        assert!(end - start > 2.0);
+
+        // Padding never runs past either edge of the clip.
+        assert_eq!(initial_trim_view(600.0, 0.0, 1.0).0, 0.0);
+        assert!((initial_trim_view(600.0, 99.0, 100.0).1 - 100.0).abs() < 0.001);
+
+        // A nearly empty selection still gets a slice wide enough to grab
+        // both handles.
+        let (start, end) = initial_trim_view(6000.0, 50.0, 50.001);
+        assert!(end - start >= super::MIN_TRIM_VIEW_SPAN_PCT - 0.001);
+    }
+
+    #[test]
+    fn trim_view_mapping_round_trips_absolute_positions() {
+        let (view_start, view_end) = (20.0, 30.0);
+        for pct in [20.0, 22.5, 25.0, 30.0] {
+            let fraction = trim_pct_to_fraction(pct, view_start, view_end);
+            let back = trim_fraction_to_pct(fraction, view_start, view_end);
+            assert!((back - pct).abs() < 0.001, "{pct} -> {back}");
+        }
+        assert_eq!(trim_pct_to_fraction(10.0, view_start, view_end), 0.0);
+        assert_eq!(trim_pct_to_fraction(40.0, view_start, view_end), 1.0);
+        assert_eq!(trim_fraction_to_pct(0.0, view_start, view_end), view_start);
+        assert_eq!(trim_fraction_to_pct(1.0, view_start, view_end), view_end);
+    }
+
+    #[test]
+    fn middle_drag_pans_the_trim_view_and_stays_inside_the_clip() {
+        // Dragging right reveals earlier audio; dragging left reveals later
+        // audio. The slice never leaves the clip.
+        assert!((trim_view_start_after_pan(50.0, 20.0, 10.0) - 40.0).abs() < 0.001);
+        assert!((trim_view_start_after_pan(50.0, 20.0, -10.0) - 60.0).abs() < 0.001);
+
+        // The slice never leaves the clip.
+        assert_eq!(trim_view_start_after_pan(5.0, 20.0, 10.0), 0.0);
+        assert_eq!(trim_view_start_after_pan(85.0, 20.0, -10.0), 80.0);
+    }
+
+    #[test]
+    fn zooming_out_from_a_sliver_away_snaps_to_the_whole_clip() {
+        assert_eq!(snapped_zoom_span(90.0, 1.2), 100.0);
+        assert_eq!(snapped_zoom_span(60.0, 1.5), 90.0);
+        assert_eq!(snapped_zoom_span(100.0, 0.65), 65.0);
+    }
+
+    #[test]
     fn pad_playback_speed_round_trips_through_saved_state() {
         let state = PersistedState {
             sounds: vec![PersistedSound {
                 path: "clip.mp3".into(),
+                id: None,
                 volume: 1.0,
                 playback_speed: 1.25,
                 title: None,

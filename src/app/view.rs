@@ -20,12 +20,16 @@ use gpui_kit::{
     Anchor, AnimationExt as _, AnyElement, App, AppContext as _, Bounds, ClickEvent, CursorStyle,
     ExternalPaths, FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, PathBuilder,
-    Render, SharedString, SpringAnimation, SpringConfig, StatefulInteractiveElement as _,
-    Styled as _, Window, WindowControlArea, canvas, div, point, prelude::FluentBuilder as _, px,
-    quad, relative, rems, size, transparent_black,
+    Render, ScrollDelta, ScrollEvent, SharedString, SpringAnimation, SpringConfig,
+    StatefulInteractiveElement as _, Styled as _, Window, WindowControlArea, canvas, div, point,
+    prelude::FluentBuilder as _, px, quad, relative, rems, size, transparent_black,
 };
 
-use super::{ROUTING_PANEL_WIDTH_REM, SIDEBAR_WIDTH_REM, SettingsSection, SoundboardApp, TrimDrag};
+use super::{
+    FULL_TRIM_VIEW_TOLERANCE_PCT, MIN_TRIM_VIEW_SPAN_PCT, ROUTING_PANEL_WIDTH_REM,
+    SIDEBAR_WIDTH_REM, SettingsSection, SoundboardApp, TrimDrag, trim_fraction_to_pct,
+    trim_pct_to_fraction,
+};
 use crate::{
     model::{
         Sound, SoundId, SoundStatus, format_duration, format_percent, format_playback_speed,
@@ -731,18 +735,36 @@ impl SoundboardApp {
             .as_ref()
             .map(|source| source.samples.as_ref())
             .unwrap_or(&[]);
-        let peaks = peak_bars(waveform, 260);
+        let view_start_pct = self.trim_view_start_pct;
+        let view_end_pct = self.trim_view_end_pct;
+        let view_span_pct = self.trim_view_span_pct();
+        let view_start_seconds = duration * view_start_pct / 100.0;
+        let view_end_seconds = duration * view_end_pct / 100.0;
+        let view_zoomed = view_span_pct < 100.0 - FULL_TRIM_VIEW_TOLERANCE_PCT;
+        let peaks = peak_bars(waveform, 260, view_start_pct / 100.0, view_end_pct / 100.0);
         let title = sound.title.clone();
-        let start_fraction = self.trim_start_pct / 100.0;
-        let end_fraction = self.trim_end_pct / 100.0;
+        let start_fraction =
+            trim_pct_to_fraction(self.trim_start_pct, view_start_pct, view_end_pct);
+        let end_fraction = trim_pct_to_fraction(self.trim_end_pct, view_start_pct, view_end_pct);
+        let start_visible =
+            self.trim_start_pct >= view_start_pct && self.trim_start_pct <= view_end_pct;
+        let end_visible = self.trim_end_pct >= view_start_pct && self.trim_end_pct <= view_end_pct;
         let dragging = self.trim_drag.is_some();
+        let panning = self.trim_pan.is_some();
         let preview_active = self.trim_preview_active;
-        let cursor_fraction = self.trim_cursor_pct / 100.0;
-        let cursor_seconds = duration * cursor_fraction;
+        let cursor_fraction =
+            trim_pct_to_fraction(self.trim_cursor_pct, view_start_pct, view_end_pct);
+        let cursor_visible =
+            self.trim_cursor_pct >= view_start_pct && self.trim_cursor_pct <= view_end_pct;
+        let cursor_seconds = duration * self.trim_cursor_pct / 100.0;
         let cursor_lock = self.trim_cursor_lock;
         let cursor_differs = (self.trim_cursor_pct - self.trim_start_pct).abs() > 0.05;
         let cursor_dragging = matches!(self.trim_drag, Some(TrimDrag::Cursor));
         let show_cursor = cursor_differs || preview_active || cursor_dragging;
+        let can_zoom_out = view_span_pct < 100.0 - 0.001;
+        let can_zoom_in = view_span_pct > MIN_TRIM_VIEW_SPAN_PCT + 0.001;
+        let can_fit_selection =
+            (self.trim_end_pct - self.trim_start_pct) < 100.0 - MIN_TRIM_VIEW_SPAN_PCT;
         let app = cx.entity().downgrade();
         let bounds_store: Rc<Cell<Option<Bounds<gpui_kit::Pixels>>>> = Rc::new(Cell::new(None));
 
@@ -756,7 +778,11 @@ impl SoundboardApp {
             .border_color(p.line_strong)
             .bg(p.console)
             .overflow_hidden()
-            .cursor_ew_resize()
+            .cursor(if panning {
+                CursorStyle::ClosedHand
+            } else {
+                CursorStyle::ResizeLeftRight
+            })
             .on_mouse_down(MouseButton::Left, {
                 let bounds_store = bounds_store.clone();
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -768,33 +794,60 @@ impl SoundboardApp {
                     let usable = (width - inset * 2.0).max(1.0);
                     let x = (f32::from(event.position.x) - f32::from(bounds.origin.x) - inset)
                         .clamp(0.0, usable);
-                    let pointer_pct = x / usable * 100.0;
-                    let start_x = usable * this.trim_start_pct / 100.0;
-                    let end_x = usable * this.trim_end_pct / 100.0;
+                    let view_start = this.trim_view_start_pct;
+                    let view_end = this.trim_view_end_pct;
+                    let pointer_pct = trim_fraction_to_pct(x / usable, view_start, view_end);
+                    let start_x =
+                        usable * trim_pct_to_fraction(this.trim_start_pct, view_start, view_end);
+                    let end_x =
+                        usable * trim_pct_to_fraction(this.trim_end_pct, view_start, view_end);
                     let tolerance = 14.0;
-                    let snap_pct = 12.0 / usable * 100.0;
+                    let snap_pct = 12.0 / usable * this.trim_view_span_pct();
                     // The cursor's knob sits in a dedicated top strip: a click in
                     // it always grabs the cursor, even where a handle lies below.
-                    let knob_zone = f32::from(event.position.y) - f32::from(bounds.origin.y) <= 18.0;
-                    let cursor_x = usable * this.trim_cursor_pct / 100.0;
+                    let knob_zone =
+                        f32::from(event.position.y) - f32::from(bounds.origin.y) <= 18.0;
+                    let cursor_x =
+                        usable * trim_pct_to_fraction(this.trim_cursor_pct, view_start, view_end);
+                    let cursor_visible =
+                        this.trim_cursor_pct >= view_start && this.trim_cursor_pct <= view_end;
                     let cursor_dist = (x - cursor_x).abs();
-                    let handle_dist = (x - start_x).abs().min((x - end_x).abs());
-                    let kind = if cursor_dist <= tolerance
+                    let start_dist =
+                        if this.trim_start_pct >= view_start && this.trim_start_pct <= view_end {
+                            (x - start_x).abs()
+                        } else {
+                            f32::INFINITY
+                        };
+                    let end_dist =
+                        if this.trim_end_pct >= view_start && this.trim_end_pct <= view_end {
+                            (x - end_x).abs()
+                        } else {
+                            f32::INFINITY
+                        };
+                    let handle_dist = start_dist.min(end_dist);
+                    let kind = if cursor_visible
+                        && cursor_dist <= tolerance
                         && (cursor_dist < handle_dist || knob_zone)
                     {
                         TrimDrag::Cursor
-                    } else if (x - start_x).abs() <= tolerance {
+                    } else if start_dist <= tolerance {
                         TrimDrag::Start
-                    } else if (x - end_x).abs() <= tolerance {
+                    } else if end_dist <= tolerance {
                         TrimDrag::End
                     } else if pointer_pct > this.trim_start_pct && pointer_pct < this.trim_end_pct {
                         TrimDrag::Window {
                             grab: pointer_pct - this.trim_start_pct,
+                            click_pct: Some(pointer_pct),
+                            click_slop_pct: 3.0 / usable * this.trim_view_span_pct(),
                         }
-                    } else if (x - start_x).abs() <= (x - end_x).abs() {
+                    } else if start_dist.is_finite() && start_dist <= end_dist {
                         TrimDrag::Start
-                    } else {
+                    } else if end_dist.is_finite() {
                         TrimDrag::End
+                    } else {
+                        // Away from every handle: the click places the cursor,
+                        // even when both handles sit outside the visible slice.
+                        TrimDrag::Cursor
                     };
                     this.begin_trim_drag(kind, pointer_pct, snap_pct, window, cx);
                 })
@@ -805,6 +858,58 @@ impl SoundboardApp {
                     this.end_trim_drag(cx);
                 }),
             )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, _, _, cx| {
+                    this.end_trim_pan(cx);
+                }),
+            )
+            .on_mouse_down(MouseButton::Middle, {
+                let bounds_store = bounds_store.clone();
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    let Some(bounds) = bounds_store.get() else {
+                        return;
+                    };
+                    if this.trim_drag.is_some() {
+                        return;
+                    }
+                    let inset = 6.0f32;
+                    let x = f32::from(event.position.x) - f32::from(bounds.origin.x) - inset;
+                    this.begin_trim_pan(x, cx);
+                })
+            })
+            .on_scroll({
+                let bounds_store = bounds_store.clone();
+                cx.listener(move |this, event: &ScrollEvent, _window, cx| {
+                    let Some(bounds) = bounds_store.get() else {
+                        return;
+                    };
+                    let width = f32::from(bounds.size.width).max(1.0);
+                    let inset = 6.0f32;
+                    let usable = (width - inset * 2.0).max(1.0);
+                    let x = (f32::from(event.position.x) - f32::from(bounds.origin.x) - inset)
+                        .clamp(0.0, usable);
+                    let pointer_pct = trim_fraction_to_pct(
+                        x / usable,
+                        this.trim_view_start_pct,
+                        this.trim_view_end_pct,
+                    );
+                    let delta = match event.delta {
+                        ScrollDelta::Pixels(delta) => f32::from(delta.x) + f32::from(delta.y),
+                        ScrollDelta::Lines(delta) => delta.x + delta.y,
+                    };
+                    if delta.abs() < f32::EPSILON {
+                        return;
+                    }
+                    if event.modifiers.control {
+                        let factor = if delta > 0.0 { 0.75 } else { 1.0 / 0.75 };
+                        this.zoom_trim_view(pointer_pct, factor, cx);
+                    } else {
+                        let span = this.trim_view_span_pct();
+                        this.pan_trim_view(-delta * span * 0.08, cx);
+                    }
+                })
+            })
             .child(
                 canvas(|bounds, _, _| bounds, {
                     let bounds_store = bounds_store.clone();
@@ -858,7 +963,12 @@ impl SoundboardApp {
                             window.paint_path(path, p.blue);
                         }
 
-                        for boundary in [start_fraction, end_fraction] {
+                        for (boundary, visible) in
+                            [(start_fraction, start_visible), (end_fraction, end_visible)]
+                        {
+                            if !visible {
+                                continue;
+                            }
                             let x = origin_x + inset + usable * boundary;
                             window.paint_quad(quad(
                                 Bounds {
@@ -899,29 +1009,31 @@ impl SoundboardApp {
                         }
 
                         // Amber scrub cursor, painted last so it stays on top.
-                        let cursor_x = origin_x + inset + usable * cursor_fraction;
-                        window.paint_quad(quad(
-                            Bounds {
-                                origin: point(px(cursor_x - 1.0), px(origin_y + 2.0)),
-                                size: size(px(2.0), px((height - 4.0).max(1.0))),
-                            },
-                            px(0.0),
-                            p.amber,
-                            px(0.0),
-                            transparent_black(),
-                            Default::default(),
-                        ));
-                        window.paint_quad(quad(
-                            Bounds {
-                                origin: point(px(cursor_x - 5.0), px(origin_y + 2.0)),
-                                size: size(px(10.0), px(10.0)),
-                            },
-                            px(5.0),
-                            p.amber,
-                            px(1.5),
-                            p.console,
-                            Default::default(),
-                        ));
+                        if cursor_visible {
+                            let cursor_x = origin_x + inset + usable * cursor_fraction;
+                            window.paint_quad(quad(
+                                Bounds {
+                                    origin: point(px(cursor_x - 1.0), px(origin_y + 2.0)),
+                                    size: size(px(2.0), px((height - 4.0).max(1.0))),
+                                },
+                                px(0.0),
+                                p.amber,
+                                px(0.0),
+                                transparent_black(),
+                                Default::default(),
+                            ));
+                            window.paint_quad(quad(
+                                Bounds {
+                                    origin: point(px(cursor_x - 5.0), px(origin_y + 2.0)),
+                                    size: size(px(10.0), px(10.0)),
+                                },
+                                px(5.0),
+                                p.amber,
+                                px(1.5),
+                                p.console,
+                                Default::default(),
+                            ));
+                        }
 
                         if dragging {
                             let app_move = app.clone();
@@ -936,8 +1048,14 @@ impl SoundboardApp {
                                         - f32::from(track_bounds.origin.x)
                                         - inset)
                                         .clamp(0.0, usable);
-                                    let pointer_pct = x / usable * 100.0;
-                                    let snap_pct = 12.0 / usable * 100.0;
+                                    let pointer_pct = trim_fraction_to_pct(
+                                        x / usable,
+                                        view_start_pct,
+                                        view_end_pct,
+                                    );
+                                    let snap_pct = 12.0 / usable
+                                        * (view_end_pct - view_start_pct)
+                                            .max(MIN_TRIM_VIEW_SPAN_PCT);
                                     let _ = app_move.update(cx, |this, cx| {
                                         this.update_trim_drag(pointer_pct, snap_pct, cx);
                                     });
@@ -951,18 +1069,51 @@ impl SoundboardApp {
                                 }
                             });
                         }
+                        if panning {
+                            let app_move = app.clone();
+                            let app_up = app.clone();
+                            let track_bounds = bounds;
+                            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                                if phase.bubble()
+                                    && event.pressed_button == Some(MouseButton::Middle)
+                                {
+                                    let width = f32::from(track_bounds.size.width).max(1.0);
+                                    let inset = 6.0f32;
+                                    let usable = (width - inset * 2.0).max(1.0);
+                                    let x = f32::from(event.position.x)
+                                        - f32::from(track_bounds.origin.x)
+                                        - inset;
+                                    let _ = app_move.update(cx, |this, cx| {
+                                        this.update_trim_pan(x, usable, cx);
+                                    });
+                                }
+                            });
+                            window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                                if phase.bubble() && event.button == MouseButton::Middle {
+                                    let _ = app_up.update(cx, |this, cx| {
+                                        this.end_trim_pan(cx);
+                                    });
+                                }
+                            });
+                        }
                     }
                 })
                 .absolute()
                 .inset_0(),
             );
 
-        h_flex()
-            .mx_6()
+        // Keep the margins on an outer stretch container so the panel always
+        // fits the parent width instead of adding side margins to it.
+        div()
+            .w_full()
+            .px_6()
             .mt_3()
-            .p_3()
-            .gap_3()
-            .items_center()
+            .child(
+                h_flex()
+                    .w_full()
+                    .p_3()
+                    .gap_3()
+                    .items_center()
             .rounded(cx.theme().radius_lg)
             .border_1()
             .border_color(p.blue.opacity(0.45))
@@ -983,6 +1134,7 @@ impl SoundboardApp {
                                 div()
                                     .v_flex()
                                     .gap_0()
+                                    .min_w_0()
                                     .child(
                                         div()
                                             .font_family(MONO_FONT)
@@ -1004,6 +1156,7 @@ impl SoundboardApp {
                                 h_flex()
                                     .gap_3()
                                     .items_center()
+                                    .min_w_0()
                                     .child(
                                         Button::new("audition-trim")
                                             .label(if preview_active { "Stop" } else { "Audition" })
@@ -1025,6 +1178,8 @@ impl SoundboardApp {
                                     )
                                     .child(
                                         div()
+                                            .truncate()
+                                            .min_w_0()
                                             .font_family(MONO_FONT)
                                             .text_xs()
                                             .text_color(p.ink_muted)
@@ -1051,8 +1206,21 @@ impl SoundboardApp {
                                     .font_family(MONO_FONT)
                                     .text_xs()
                                     .text_color(p.ink_muted)
-                                    .child("DRAG THE CURSOR · DRAG THE HANDLES · DRAG INSIDE TO MOVE"),
+                                    .child("CLICK TO PLACE THE CURSOR · DRAG HANDLES OR SELECTION · MIDDLE-DRAG TO PAN · CTRL+SCROLL TO ZOOM"),
                             )
+                            .when(view_zoomed, |this| {
+                                this.child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_xs()
+                                        .text_color(p.ink_muted)
+                                        .child(format!(
+                                            "VIEW {} – {}",
+                                            format_time_precise(view_start_seconds),
+                                            format_time_precise(view_end_seconds)
+                                        )),
+                                )
+                            })
                             .when(show_cursor, |this| {
                                 this.child(
                                     div()
@@ -1062,6 +1230,60 @@ impl SoundboardApp {
                                         .child(format!("CURSOR {}", format_time_precise(cursor_seconds))),
                                 )
                             })
+                            .child(
+                                Button::new("trim-zoom-out")
+                                    .small()
+                                    .ghost()
+                                    .icon(Icon::new(AppIcon::ZoomOut).size_3p5())
+                                    .tooltip("Zoom out")
+                                    .accessibility_label("Zoom the trim waveform out")
+                                    .disabled(!can_zoom_out)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let center = (this.trim_view_start_pct
+                                            + this.trim_view_end_pct)
+                                            * 0.5;
+                                        this.zoom_trim_view(center, 1.5, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("trim-zoom-in")
+                                    .small()
+                                    .ghost()
+                                    .icon(Icon::new(AppIcon::ZoomIn).size_3p5())
+                                    .tooltip("Zoom in")
+                                    .accessibility_label("Zoom the trim waveform in")
+                                    .disabled(!can_zoom_in)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let center = (this.trim_view_start_pct
+                                            + this.trim_view_end_pct)
+                                            * 0.5;
+                                        this.zoom_trim_view(center, 0.65, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("trim-fit-clip")
+                                    .small()
+                                    .ghost()
+                                    .icon(Icon::new(AppIcon::Scan).size_3p5())
+                                    .tooltip("Fit the whole clip")
+                                    .accessibility_label("Show the whole clip")
+                                    .disabled(!can_zoom_out)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.fit_trim_view_to_clip(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("trim-fit-selection")
+                                    .small()
+                                    .ghost()
+                                    .icon(Icon::new(AppIcon::ScanSearch).size_3p5())
+                                    .tooltip("Zoom onto the valid portion")
+                                    .accessibility_label("Zoom onto the valid portion")
+                                    .disabled(!can_fit_selection)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.fit_trim_view_to_selection(cx);
+                                    })),
+                            )
                             .child(
                                 Button::new("trim-cursor-lock")
                                     .small()
@@ -1107,8 +1329,9 @@ impl SoundboardApp {
                                 this.apply_trim(window, cx);
                             })),
                     ),
-            )
-            .into_any_element()
+            ),
+        )
+        .into_any_element()
     }
 
     fn render_empty_state(&mut self, cx: &mut gpui_kit::Context<Self>) -> impl IntoElement {
@@ -1341,12 +1564,6 @@ impl SoundboardApp {
         };
         let waveform = fit_peaks(&waveform, waveform_bar_capacity(tile_width));
 
-        let tile_icon = if playing {
-            AppIcon::Square
-        } else {
-            AppIcon::Play
-        };
-
         let renaming = self.rename_target == Some(id);
         let volume_slider = self.volume_sliders.get(&id).cloned();
         let speed_slider = self.speed_sliders.get(&id).cloned();
@@ -1384,18 +1601,26 @@ impl SoundboardApp {
                         .hover(p.tile_hover)
                         .active(p.tile_active),
                 )
-                .size_6()
-                .p_0()
+                .small()
+                .px_1()
+                // Fixed width: the widest value ("0.25×") must never change the
+                // button's size between speed steps.
+                .w(px(44.0))
                 .rounded(cx.theme().radius)
                 .tab_stop(false)
-                .icon(
-                    Icon::new(AppIcon::Clock)
-                        .size_3()
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .font_family(MONO_FONT)
+                        .text_xs()
                         .text_color(if speed_changed {
                             p.amber
                         } else {
                             p.cream_muted
-                        }),
+                        })
+                        .child(speed_label.clone()),
                 )
                 .accessibility_label(format!("Playback speed {speed_label}"))
                 .tooltip(format!("Pad speed · {speed_label}"));
@@ -1690,9 +1915,11 @@ impl SoundboardApp {
                                     .tooltip(|window, cx| {
                                         Tooltip::new("Click to type a value").build(window, cx)
                                     })
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                        this.begin_volume_edit(id, window, cx);
-                                    }))
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.begin_volume_edit(id, window, cx);
+                                        },
+                                    ))
                                     .child(format_percent(sound.volume))
                                     .into_any_element()
                             }),
@@ -1753,11 +1980,22 @@ impl SoundboardApp {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(Icon::new(tile_icon).size_3().text_color(if playing {
-                                p.signal
+                            .child(if playing {
+                                // A plain rounded square centers the stop glyph
+                                // inside the circular hit target.
+                                div()
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .rounded(px(1.5))
+                                    .border_1()
+                                    .border_color(p.signal)
+                                    .into_any_element()
                             } else {
-                                p.cream
-                            }))
+                                Icon::new(AppIcon::Play)
+                                    .size_3()
+                                    .text_color(p.cream)
+                                    .into_any_element()
+                            })
                             .into_any_element()
                     }),
             );
@@ -3255,15 +3493,25 @@ impl Render for SoundDragPreview {
     }
 }
 
-fn peak_bars(samples: &[f32], bars: usize) -> Vec<f32> {
+/// Peak envelope for the `start_fraction..end_fraction` slice of the clip.
+fn peak_bars(samples: &[f32], bars: usize, start_fraction: f32, end_fraction: f32) -> Vec<f32> {
     let frames = samples.len() / 2;
     if frames == 0 || bars == 0 {
         return Vec::new();
     }
+    let from = (start_fraction.clamp(0.0, 1.0) * frames as f32).floor() as usize;
+    let to = (end_fraction.clamp(0.0, 1.0) * frames as f32)
+        .ceil()
+        .max(from as f32 + 1.0)
+        .min(frames as f32) as usize;
+    if to <= from {
+        return Vec::new();
+    }
+    let span = to - from;
     let mut peaks = Vec::with_capacity(bars);
     for bar in 0..bars {
-        let start = bar * frames / bars;
-        let end = ((bar + 1) * frames / bars).max(start + 1).min(frames);
+        let start = from + bar * span / bars;
+        let end = (from + (bar + 1) * span / bars).max(start + 1).min(to);
         let stride = ((end - start) / 64).max(1);
         let mut peak = 0.0f32;
         for frame in (start..end).step_by(stride) {
@@ -3778,7 +4026,7 @@ fn vu_meter(level_l: f32, level_r: f32) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::{
-        WAVEFORM_BAR_GAP, WAVEFORM_BAR_MIN_WIDTH, WAVEFORM_INSET_X, fit_peaks,
+        WAVEFORM_BAR_GAP, WAVEFORM_BAR_MIN_WIDTH, WAVEFORM_INSET_X, fit_peaks, peak_bars,
         waveform_bar_capacity,
     };
 
@@ -3808,5 +4056,25 @@ mod tests {
         // Nothing to reduce: the envelope is returned untouched.
         assert_eq!(fit_peaks(&[0.1, 0.2], 8), vec![0.1, 0.2]);
         assert!(fit_peaks(&[], 8).is_empty());
+    }
+
+    #[test]
+    fn trim_peaks_only_read_the_visible_slice() {
+        let mut samples = Vec::new();
+        for frame in 0..100 {
+            let value = if frame < 50 { 0.8 } else { 0.0 };
+            samples.push(value);
+            samples.push(value);
+        }
+
+        let loud = peak_bars(&samples, 16, 0.0, 0.5);
+        let silent = peak_bars(&samples, 16, 0.5, 1.0);
+        assert_eq!(loud.len(), 16);
+        assert_eq!(silent.len(), 16);
+        assert!(loud.iter().all(|peak| *peak > 0.0));
+        assert!(silent.iter().all(|peak| *peak == 0.0));
+
+        // A slice at the extreme end never panics.
+        assert_eq!(peak_bars(&samples, 16, 1.0, 1.0).len(), 0);
     }
 }
